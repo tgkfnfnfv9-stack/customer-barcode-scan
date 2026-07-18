@@ -111,6 +111,12 @@
   .copy.done{background:var(--green); border-color:var(--green); color:#fff;}
   .copy svg{width:15px; height:15px;}
 
+  .row.warn{border-color:rgba(224,161,6,.5);}
+  .row .warnnote{display:flex; align-items:flex-start; gap:6px; margin-top:10px; padding:9px 10px;
+    background:rgba(224,161,6,.10); border:1px solid rgba(224,161,6,.35); border-radius:9px;
+    font-size:12px; font-weight:700; color:#8A6200; line-height:1.45;}
+  .row .warnnote svg{width:15px; height:15px; flex:none; margin-top:1px;}
+
   input[type=file]{display:none;}
   footer{margin-top:18px; text-align:center; font-size:11px; color:#A2A8B0; line-height:1.6;}
 </style>
@@ -187,9 +193,17 @@ const SEARCH_URL = 'https://www.kkmt.co.jp/products?utf8=%E2%9C%93&search_forms_
    例)  "P008493": "P0084493"   ← 左=スキャン値 / 右=検索に使うコード   */
 const OVERRIDE_MAP = {
 };
+
+/* 印字の英数字フォーマット（例: H020084 ＝ 英字1文字＋数字）。
+   スキャン結果・手入力をこの形式で照合し、合わない時は「要確認」を表示。
+   桁数が違う機種があればここを調整（数字は 3〜10 桁を許容）。 */
+const CODE_PATTERN = /^[A-Za-z][0-9]{3,10}$/;
+function cleanCode(s){ return String(s||'').replace(/[　\s]+/g,'').trim(); } // 空白（全角/半角）除去
+function isExpectedFormat(code){ return CODE_PATTERN.test(code); }
 /* ========================================================= */
 
-const READER_OPTS={tryHarder:true, maxNumberOfSymbols:1};
+const READER_OPTS     ={tryHarder:true, maxNumberOfSymbols:1};
+const READER_OPTS_HARD={tryHarder:true, tryDenoise:true, maxNumberOfSymbols:1};
 const el=id=>document.getElementById(id);
 const ledEl=el('led'), statusEl=el('status');
 const histList=el('histList'), histCount=el('histCount'), emptyState=el('emptyState'), resetAllBtn=el('resetAllBtn'), copyAllBtn=el('copyAllBtn');
@@ -211,6 +225,7 @@ function svgArrow(){ return '<svg viewBox="0 0 24 24" fill="none" stroke="curren
 function svgX(){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>'; }
 function svgCopy(){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'; }
 function svgCheck(){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'; }
+function svgWarn(){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>'; }
 
 function render(){
   histCount.textContent='('+history.length+'件)';
@@ -220,6 +235,8 @@ function render(){
   histList.textContent='';
   history.forEach(item=>{
     const row=document.createElement('div'); row.className='row';
+    const bad = !isExpectedFormat(item.code);
+    if(bad) row.className='row warn';
 
     const top=document.createElement('div'); top.className='top';
     const num=document.createElement('div'); num.className='num'; num.textContent=item.code;
@@ -236,24 +253,33 @@ function render(){
       }).catch(()=>{ setStatus('コピーできませんでした。長押しで選択してください','err'); }); };
     top.appendChild(num); if(item.fmt) top.appendChild(fmt); top.appendChild(cp); top.appendChild(del);
 
+    let warnNote=null;
+    if(bad){
+      warnNote=document.createElement('div'); warnNote.className='warnnote';
+      warnNote.innerHTML=svgWarn()+'<span>印字の英字＋数字（例：H020084）と一致するか確認してください</span>';
+    }
+
     const acts=document.createElement('div'); acts.className='acts';
     const b1=document.createElement('button'); b1.className='go primary';
     b1.innerHTML='この機械を見る'+svgArrow();
     b1.onclick=()=>openExternal(buildURL(SEARCH_URL,item.code));
     acts.appendChild(b1);
 
-    row.appendChild(top); row.appendChild(acts);
+    row.appendChild(top); if(warnNote) row.appendChild(warnNote); row.appendChild(acts);
     histList.appendChild(row);
   });
 }
 
 function addScan(code,fmt){
+  const c=cleanCode(code);
+  const ok=isExpectedFormat(c);
   // 重複は追加せず先頭へ移動（Q2B）
-  history=history.filter(x=>x.code!==code);
-  history.unshift({code,fmt});
+  history=history.filter(x=>x.code!==c);
+  history.unshift({code:c,fmt});
   saveHistory();
   render();
-  setStatus('読み取り成功：'+code,'ready');
+  if(ok) setStatus('読み取り成功：'+c,'ready');
+  else   setStatus('要確認：'+c+'（印字の英字＋数字と一致するか確認してください）','err');
 }
 
 async function initLib(){
@@ -270,13 +296,97 @@ async function initLib(){
   setStatus('準備完了','ready');
 }
 
+/* EXIF 回転込みで画像を読み込む（iPhone の縦横回転対策） */
+function loadImageEl(file){
+  return new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{ URL.revokeObjectURL(url); resolve(img); };
+    img.onerror=e=>{ URL.revokeObjectURL(url); reject(e||new Error('image load failed')); };
+    img.src=url;
+  });
+}
+
+/* 最大辺 maxDim で canvas に描画し ImageData を返す */
+function drawToImageData(img,maxDim){
+  const w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+  if(!w||!h) return null;
+  const scale=Math.min(1, maxDim/Math.max(w,h));
+  const cw=Math.max(1,Math.round(w*scale)), ch=Math.max(1,Math.round(h*scale));
+  const cv=document.createElement('canvas'); cv.width=cw; cv.height=ch;
+  const ctx=cv.getContext('2d',{willReadFrequently:true});
+  if(!ctx) return null;
+  ctx.drawImage(img,0,0,cw,ch);
+  try{ return ctx.getImageData(0,0,cw,ch); }catch(e){ return null; }
+}
+
+/* グレースケール化＋自動コントラスト（1〜99%点で伸張）。data を書き換えて返す */
+function grayAutoContrast(imgData){
+  const d=imgData.data, n=imgData.width*imgData.height;
+  const lum=new Uint8Array(n), hist=new Uint32Array(256);
+  for(let i=0,p=0;i<n;i++,p+=4){ const g=(306*d[p]+601*d[p+1]+117*d[p+2]+512)>>10; lum[i]=g; hist[g]++; }
+  const loCount=Math.floor(n*0.01), hiCount=Math.floor(n*0.01);
+  let acc=0,minV=0,maxV=255;
+  for(let v=0;v<256;v++){ acc+=hist[v]; if(acc>loCount){ minV=v; break; } }
+  acc=0; for(let v=255;v>=0;v--){ acc+=hist[v]; if(acc>hiCount){ maxV=v; break; } }
+  const range=Math.max(1,maxV-minV), lut=new Uint8Array(256);
+  for(let v=0;v<256;v++){ const t=Math.round((v-minV)*255/range); lut[v]=t<0?0:t>255?255:t; }
+  for(let i=0,p=0;i<n;i++,p+=4){ const g=lut[lum[i]]; d[p]=d[p+1]=d[p+2]=g; }
+  return imgData;
+}
+
+/* 3x3 シャープ（アンシャープ近似）。グレー済み ImageData から新しい ImageData を返す */
+function sharpen(imgData){
+  const w=imgData.width,h=imgData.height,src=imgData.data;
+  const out=new ImageData(w,h), dst=out.data;
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      const p=(y*w+x)<<2;
+      let v;
+      if(x===0||y===0||x===w-1||y===h-1){ v=src[p]; }
+      else{
+        v=5*src[p]-src[((y*w+x-1)<<2)]-src[((y*w+x+1)<<2)]-src[(((y-1)*w+x)<<2)]-src[(((y+1)*w+x)<<2)];
+        v=v<0?0:v>255?255:v;
+      }
+      dst[p]=dst[p+1]=dst[p+2]=v; dst[p+3]=255;
+    }
+  }
+  return out;
+}
+
+async function tryDecode(imgData){
+  if(!imgData) return null;
+  try{
+    let r=await readBarcodes(imgData,READER_OPTS);
+    if(r&&r.length) return r;
+    r=await readBarcodes(imgData,READER_OPTS_HARD);
+    if(r&&r.length) return r;
+  }catch(e){}
+  return null;
+}
+
+/* まず元ファイルをそのまま。ダメなら前処理（コントラスト補正・シャープ・拡大）で再挑戦 */
+async function decodeFile(file){
+  try{ const r=await readBarcodes(file,READER_OPTS); if(r&&r.length) return r; }catch(e){}
+  let img=null;
+  try{ img=await loadImageEl(file); }catch(e){ return null; }
+  for(const mx of [1600,2400]){
+    const base=drawToImageData(img,mx);
+    if(!base) continue;
+    const gac=grayAutoContrast(base);          // グレー＋自動コントラスト
+    let r=await tryDecode(gac); if(r) return r;
+    r=await tryDecode(sharpen(gac)); if(r) return r;  // さらにシャープ
+  }
+  return null;
+}
+
 async function handleFile(file){
   if(!file || !readBarcodes) return;
   setStatus('解析中…','busy');
   try{
-    const r=await readBarcodes(file,READER_OPTS);
+    const r=await decodeFile(file);
     if(r&&r.length) addScan(r[0].text, r[0].format);
-    else setStatus('読み取れませんでした。もっと近づけて撮影してください','err');
+    else setStatus('読み取れませんでした。明るい所で、バーコードを大きく正面から撮ってください','err');
   }catch(e){ setStatus('解析に失敗：'+((e&&e.message)||e),'err'); }
 }
 
@@ -289,10 +399,9 @@ resetAllBtn.addEventListener('click',()=>{ history=[]; saveHistory(); render(); 
 /* 直接入力して登録（手入力） */
 const manualInput=el('manualInput'), manualAddBtn=el('manualAddBtn');
 function submitManual(){
-  const code=manualInput.value.trim();
+  const code=cleanCode(manualInput.value).toUpperCase(); // 印字どおり英字は大文字に統一
   if(!code){ setStatus('バーコード番号を入力してください','err'); manualInput.focus(); return; }
   addScan(code,'手入力');
-  setStatus('登録しました：'+code,'ready');
   manualInput.value=''; manualInput.focus();
 }
 manualAddBtn.addEventListener('click',submitManual);
