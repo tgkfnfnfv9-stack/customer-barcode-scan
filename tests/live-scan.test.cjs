@@ -6,7 +6,7 @@ const path=require('node:path');
 
 const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 const moduleSource=html.match(/<script type="module">([\s\S]*?)<\/script>/)[1];
-const source=moduleSource.slice(0,moduleSource.lastIndexOf('\nrender();\n(async()=>'));
+const source=moduleSource.slice(0,moduleSource.lastIndexOf('\nrender();\nhistory.forEach('));
 const flush=async()=>{for(let i=0;i<12;i++) await Promise.resolve();};
 function deferred(){let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve};}
 function stream(){
@@ -14,7 +14,7 @@ function stream(){
   const track={stopped:false,stop(){this.stopped=true;},addEventListener(name,fn){listeners[name]=fn;}};
   return {track,listeners,getTracks:()=>[track],getVideoTracks:()=>[track]};
 }
-function app({getUserMedia,decode,storedHistory}={}){
+function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   const timers=new Map(), elements=new Map(), events={}, storage=new Map(), requests=[];
   let timerId=0, context;
   const openedUrls=[], copied=[];
@@ -46,19 +46,28 @@ function app({getUserMedia,decode,storedHistory}={}){
     localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
     location:{href:'https://example.test/',origin:'https://example.test/',pathname:'/'},
     setTimeout:(fn,ms)=>{const id=++timerId; timers.set(id,{fn,ms}); return id;},clearTimeout:id=>timers.delete(id),
-    fetch:async url=>{requests.push(url); return {ok:true,status:200,json:async()=>({model_type:'テスト型番',price:1000})};},
+    fetch:async (url,options)=>{
+      requests.push({url,options});
+      return stockResponse?stockResponse(url,options):{ok:true,status:200,json:async()=>({
+        name:'マシニングセンタ',maker:'FANUC',model_type:'テスト型番',year_type:'2018',
+        detail_spec:'主軸仕様',public_price:1500000,head_picture_url:'/uploads/photo.jpg',
+        price:9000000,current_price:8000000,memo:'社内限定メモ'
+      })};
+    },
     testDecode:decode||(()=>Promise.resolve([]))
   };
   context=vm.createContext(sandbox);
   vm.runInContext(source+`\nreadBarcodes=testDecode; updateScanButton(); render();
     this.api={startScanner,stopScanner,scanCameraFrame,handleFile,addScan,
-      session:()=>cameraSession,history:()=>history,
+      session:()=>cameraSession,history:()=>history,loadStock,
       setDecoder:fn=>{readBarcodes=fn;},setMedia:fn=>{navigator.mediaDevices.getUserMedia=fn;}};`,context);
   return {api:context.api,get,camera,events,storage,requests,sandbox,openedUrls,copied,
     tick:async()=>{const next=[...timers].find(([,v])=>v.ms===220); assert.ok(next,'next scan scheduled'); timers.delete(next[0]); await next[1].fn(); await flush();},
     timers};
 }
 const code=value=>[{text:value,format:'Code128'}];
+const textTree=element=>[element.textContent,...element.children.flatMap(textTree)].join(' ');
+const descendants=element=>[element,...element.children.flatMap(descendants)];
 
 test('live decode closes camera and registers only after confirmation in another frame',async()=>{
   const a=app({decode:async()=>code('P009000')});
@@ -71,11 +80,11 @@ test('live decode closes camera and registers only after confirmation in another
   assert.equal(a.get('cameraVideo').srcObject,null);
   assert.equal(a.api.history().length,1);
   assert.equal(a.api.history()[0].code,'P009000');
-  assert.equal(JSON.stringify(a.api.history()[0]),JSON.stringify({code:'P009000',fmt:'Code128'}));
+  assert.equal(a.api.history()[0].stock.public_price,1500000);
   assert.match(a.get('scanNotice').textContent,/登録しました/);
   assert.equal(a.get('scanNotice').scrolled,true);
   assert.equal(a.get('scanButtonLabel').textContent,'スキャン');
-  assert.equal(a.requests.length,0);
+  assert.equal(a.requests.length,1);
   assert.equal(a.timers.size,0);
   assert.equal(JSON.parse(a.storage.get('kkmt_customer_barcode_history'))[0].code,'P009000');
 });
@@ -140,11 +149,11 @@ test('backgrounding, page exit, Escape, manual entry and interrupted track relea
     assert.equal(a.api.history().length,0,trigger);
   }
 });
-test('album image decoding still registers without a network request',async()=>{
+test('album image decoding registers and fetches public information',async()=>{
   const a=app({decode:async()=>code('P009002')});
   a.get('albumInput').handlers.change({target:{files:[{size:10}],value:'selected'}}); await flush();
   assert.equal(a.api.history()[0].code,'P009002');
-  assert.equal(a.requests.length,0); assert.equal(a.get('capBtn').disabled,false);
+  assert.equal(a.requests.length,1); assert.equal(a.get('capBtn').disabled,false);
 });
 test('repeated decoder errors stop camera and show retry guidance',async()=>{
   const a=app({decode:async()=>{throw new Error('decode failed');}});
@@ -154,16 +163,47 @@ test('repeated decoder errors stop camera and show retry guidance',async()=>{
   assert.match(a.get('scanNotice').textContent,/もう一度スキャン/);
 });
 
-test('existing customer history loads unchanged and machine action keeps the public search URL',async()=>{
+test('public stock displays photo, specification and public_price without a site button or private fields',async()=>{
   const stored=[{code:'P008493',fmt:'Code39'}];
   const a=app({storedHistory:stored});
   assert.equal(JSON.stringify(a.api.history()),JSON.stringify(stored));
+  await a.api.loadStock(a.api.history()[0]); await flush();
+  let row=a.get('histList').children[0];
+  assert.match(textTree(row),/公開価格.*¥1,500,000/);
+  assert.doesNotMatch(textTree(row),/社内限定メモ|¥9,000,000|¥8,000,000|この機械を見る/);
+  assert.equal(descendants(row).find(node=>node.className==='stock-photo').src,'https://www.kkmt.co.jp/uploads/photo.jpg');
+  assert.equal(descendants(row).find(node=>node.className==='stock-spec').hidden,true);
+  descendants(row).find(node=>node.className==='spec-toggle').onclick();
+  row=a.get('histList').children[0];
+  assert.equal(descendants(row).find(node=>node.className==='stock-spec').hidden,false);
+  assert.match(textTree(row),/主軸仕様/);
+  assert.equal(a.requests[0].options.credentials,'omit');
+  assert.equal(a.requests[0].options.headers.Authorization,undefined);
+  assert.equal(JSON.stringify(a.api.history()[0].stock).includes('memo'),false);
+  assert.equal(a.openedUrls.length,0);
+});
+test('no public_price hides the price row; stored history contains only code and format',async()=>{
+  const a=app({stockResponse:async()=>({ok:true,status:200,json:async()=>({
+    name:'売約済み機械',public_price:'',price:2500000,current_price:2300000,memo:'社内情報'
+  })})});
+  a.api.addScan('P009000','Code128'); await flush();
   const row=a.get('histList').children[0];
-  const actions=row.children.find(child=>child.className==='acts');
-  assert.match(actions.children[0].innerHTML,/この機械を見る/);
-  actions.children[0].onclick();
-  assert.equal(a.openedUrls[0],'https://www.kkmt.co.jp/products?utf8=%E2%9C%93&search_forms_products_search%5Bkeyword%5D=P008493&commit=%E6%A4%9C%E7%B4%A2');
-  assert.equal(a.requests.length,0);
+  assert.equal(descendants(row).some(node=>node.className==='public-price'),false);
+  assert.doesNotMatch(textTree(row),/¥2,500,000|¥2,300,000|社内情報/);
+  assert.equal(a.storage.get('kkmt_customer_barcode_history'),JSON.stringify([{code:'P009000',fmt:'Code128'}]));
+});
+test('request errors offer retry without navigating away',async()=>{
+  let failed=true;
+  const a=app({stockResponse:async()=>failed?{ok:false,status:404}:{ok:true,status:200,json:async()=>({name:'機械',public_price:500000})}});
+  a.api.addScan('P009000','Code128'); await flush();
+  let row=a.get('histList').children[0];
+  assert.match(textTree(row),/機械情報が見つかりません/);
+  failed=false;
+  const retry=descendants(row).find(node=>node.textContent==='再取得');
+  await retry.onclick(); await flush();
+  row=a.get('histList').children[0];
+  assert.match(textTree(row),/¥500,000/);
+  assert.equal(a.openedUrls.length,0);
 });
 test('manual entry, individual and all copy, deletion and reset keep their customer behavior',async()=>{
   const a=app({storedHistory:[{code:'P009000',fmt:'Code128'}]});
