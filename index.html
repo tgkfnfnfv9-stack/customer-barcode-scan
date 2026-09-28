@@ -365,7 +365,7 @@ function render(){
       overview.appendChild(summary); row.appendChild(overview);
       const price=formatPrice(stock.public_price);
       const priceLine=document.createElement('div'); priceLine.className='public-price';
-      const label=document.createElement('span'); label.className='label'; label.textContent='公開価格';
+      const label=document.createElement('span'); label.className='label'; label.textContent='価額';
       const value=document.createElement('span'); value.className=price?'value':'value missing'; value.textContent=price||'---';
       priceLine.appendChild(label); priceLine.appendChild(value); row.appendChild(priceLine);
       if(stock.detail_spec){
