@@ -182,13 +182,15 @@ test('public stock displays photo, specification and public_price without a site
   assert.equal(JSON.stringify(a.api.history()[0].stock).includes('memo'),false);
   assert.equal(a.openedUrls.length,0);
 });
-test('no public_price hides the price row; stored history contains only code and format',async()=>{
+test('no public_price shows a muted ---; stored history contains only code and format',async()=>{
   const a=app({stockResponse:async()=>({ok:true,status:200,json:async()=>({
     name:'売約済み機械',public_price:'',price:2500000,current_price:2300000,memo:'社内情報'
   })})});
   a.api.addScan('P009000','Code128'); await flush();
   const row=a.get('histList').children[0];
-  assert.equal(descendants(row).some(node=>node.className==='public-price'),false);
+  assert.equal(descendants(row).some(node=>node.className==='public-price'),true);
+  assert.match(textTree(row),/公開価格\s+---/);
+  assert.equal(descendants(row).find(node=>node.className==='value missing').textContent,'---');
   assert.doesNotMatch(textTree(row),/¥2,500,000|¥2,300,000|社内情報/);
   assert.equal(a.storage.get('kkmt_customer_barcode_history'),JSON.stringify([{code:'P009000',fmt:'Code128'}]));
 });
