@@ -169,7 +169,7 @@ test('public stock displays photo, specification and public_price without a site
   assert.equal(JSON.stringify(a.api.history()),JSON.stringify(stored));
   await a.api.loadStock(a.api.history()[0]); await flush();
   let row=a.get('histList').children[0];
-  assert.match(textTree(row),/公開価格.*¥1,500,000/);
+  assert.match(textTree(row),/価額.*¥1,500,000/);
   assert.doesNotMatch(textTree(row),/社内限定メモ|¥9,000,000|¥8,000,000|この機械を見る/);
   assert.equal(descendants(row).find(node=>node.className==='stock-photo').src,'https://www.kkmt.co.jp/uploads/photo.jpg');
   assert.equal(descendants(row).find(node=>node.className==='stock-spec').hidden,true);
@@ -189,7 +189,7 @@ test('no public_price shows a muted ---; stored history contains only code and f
   a.api.addScan('P009000','Code128'); await flush();
   const row=a.get('histList').children[0];
   assert.equal(descendants(row).some(node=>node.className==='public-price'),true);
-  assert.match(textTree(row),/公開価格\s+---/);
+  assert.match(textTree(row),/価額\s+---/);
   assert.equal(descendants(row).find(node=>node.className==='value missing').textContent,'---');
   assert.doesNotMatch(textTree(row),/¥2,500,000|¥2,300,000|社内情報/);
   assert.equal(a.storage.get('kkmt_customer_barcode_history'),JSON.stringify([{code:'P009000',fmt:'Code128'}]));
