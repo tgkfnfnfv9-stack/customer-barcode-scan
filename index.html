@@ -121,6 +121,7 @@
   .public-price{margin-top:12px; padding:11px 12px; border-radius:10px; background:var(--orange-t); display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;}
   .public-price .label{font-size:12px; font-weight:800; color:var(--orange-d);}
   .public-price .value{font-size:21px; font-weight:900; color:var(--ink); line-height:1.1;}
+  .public-price .value.missing{font-size:16px; font-weight:700; color:var(--muted);}
   .spec-toggle{width:100%; margin-top:10px; border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--ink2); padding:10px 12px; font:800 13px var(--sans); cursor:pointer;}
   .stock-spec{margin-top:8px; padding:10px 12px; border-radius:10px; background:var(--line2); color:var(--ink2); font-size:12px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere;}
 
@@ -363,12 +364,10 @@ function render(){
       });
       overview.appendChild(summary); row.appendChild(overview);
       const price=formatPrice(stock.public_price);
-      if(price){
-        const priceLine=document.createElement('div'); priceLine.className='public-price';
-        const label=document.createElement('span'); label.className='label'; label.textContent='公開価格';
-        const value=document.createElement('span'); value.className='value'; value.textContent=price;
-        priceLine.appendChild(label); priceLine.appendChild(value); row.appendChild(priceLine);
-      }
+      const priceLine=document.createElement('div'); priceLine.className='public-price';
+      const label=document.createElement('span'); label.className='label'; label.textContent='公開価格';
+      const value=document.createElement('span'); value.className=price?'value':'value missing'; value.textContent=price||'---';
+      priceLine.appendChild(label); priceLine.appendChild(value); row.appendChild(priceLine);
       if(stock.detail_spec){
         const toggle=document.createElement('button'); toggle.className='spec-toggle'; toggle.type='button';
         toggle.textContent=item.specOpen?'▲ 仕様を閉じる':'▼ 仕様を見る';
