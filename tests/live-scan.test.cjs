@@ -6,7 +6,7 @@ const path=require('node:path');
 
 const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 const moduleSource=html.match(/<script type="module">([\s\S]*?)<\/script>/)[1];
-const source=moduleSource.slice(0,moduleSource.lastIndexOf('\nrender();\nhistory.forEach('));
+const source=moduleSource.slice(0,moduleSource.lastIndexOf('\nrender();\ninitialize();'));
 const flush=async()=>{for(let i=0;i<12;i++) await Promise.resolve();};
 function deferred(){let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve};}
 function stream(){
@@ -26,10 +26,15 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
       this.classList={add(){},remove(){},toggle(){}};
     }
     get textContent(){return this._textContent;}
-    set textContent(value){this._textContent=value;this.children.length=0;}
+    set textContent(value){this._textContent=value;for(const child of this.children)child.parentNode=null;this.children.length=0;}
     addEventListener(name,fn){this.handlers[name]=fn;}
-    appendChild(child){this.children.push(child);}
-    setAttribute(){} focus(){this.focused=true;} scrollIntoView(){this.scrolled=true;}
+    appendChild(child){return this.insertBefore(child,null);}
+    insertBefore(child,before){child.remove();const i=before?this.children.indexOf(before):this.children.length;this.children.splice(i,0,child);child.parentNode=this;return child;}
+    remove(){if(this.parentNode){const a=this.parentNode.children;a.splice(a.indexOf(this),1);this.parentNode=null;}}
+    replaceWith(child){if(this.parentNode){this.parentNode.insertBefore(child,this);this.remove();}}
+    getBoundingClientRect(){const top=this.parentNode?this.parentNode.children.indexOf(this)*300-sandbox.window.scrollY:0;return {top,bottom:top+300};}
+    setAttribute(name,value){(this.attributes??={})[name]=value;} focus(){this.focused=true;sandbox.document.activeElement=this;} scrollIntoView(){this.scrolled=true;}
+    select(){} setSelectionRange(){} click(){this.handlers.click?.();}
     showModal(){this.open=true;} close(){this.open=false;}
     pause(){} play(){return Promise.resolve();}
     getContext(){return {drawImage(){},getImageData:()=>({data:new Uint8ClampedArray(16),width:2,height:2})};}
@@ -39,9 +44,9 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   get('scanNotice').hidden=true;
   const camera=stream();
   const sandbox={
-    console,URL,Date,Uint8Array,Uint8ClampedArray,TextDecoder,Blob,
+    console,URL,Date,Uint8Array,Uint8ClampedArray,TextDecoder,Blob,AbortController,
     document:{getElementById:get,createElement:()=>new Element(),body:new Element(),hidden:false,addEventListener:(n,f)=>events[n]=f},
-    window:{addEventListener:(n,f)=>events[n]=f,open(url){openedUrls.push(url);return {};}},
+    window:{addEventListener:(n,f)=>events[n]=f,open(url){openedUrls.push(url);return {};},scrollY:0,scrollBy:(x,y)=>{sandbox.window.scrollY+=y;}},
     navigator:{clipboard:{writeText:async text=>{copied.push(text);}},mediaDevices:{getUserMedia:getUserMedia||(()=>Promise.resolve(camera))}},
     localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
     location:{href:'https://example.test/',origin:'https://example.test/',pathname:'/'},
@@ -58,7 +63,8 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   };
   context=vm.createContext(sandbox);
   vm.runInContext(source+`\nreadBarcodes=testDecode; updateScanButton(); render();
-    this.api={startScanner,stopScanner,scanCameraFrame,handleFile,addScan,
+    this.api={startScanner,stopScanner,scanCameraFrame,handleFile,addScan,render,submitManual,copyText,formatPrice,publicStock,initialize,refreshHistory,
+      setHistory:items=>{history=items;render();},setInit:fn=>{initLib=fn;},
       session:()=>cameraSession,history:()=>history,loadStock,
       setDecoder:fn=>{readBarcodes=fn;},setMedia:fn=>{navigator.mediaDevices.getUserMedia=fn;}};`,context);
   return {api:context.api,get,camera,events,storage,requests,sandbox,openedUrls,copied,
@@ -224,4 +230,155 @@ test('manual entry, individual and all copy, deletion and reset keep their custo
   a.get('resetAllBtn').handlers.click();
   assert.equal(a.api.history().length,0);
   assert.equal(a.storage.get('kkmt_customer_barcode_history'),'[]');
+});
+
+test('reset and page exit cancel pending album results without reviving history',async()=>{
+  for(const trigger of ['reset','pagehide','visibilitychange']){
+    const pending=deferred(),a=app({decode:()=>pending.promise});
+    const parsing=a.api.handleFile({size:10});await flush();
+    assert.equal(a.get('albumBtn').disabled,true);
+    if(trigger==='reset')a.get('resetAllBtn').handlers.click();
+    else if(trigger==='visibilitychange'){a.sandbox.document.hidden=true;a.events.visibilitychange();}
+    else a.events.pagehide();
+    pending.resolve(code('P009002'));await parsing;await flush();
+    assert.equal(a.api.history().length,0,trigger);
+    assert.equal(a.requests.length,0,trigger);
+    assert.equal(a.get('albumBtn').disabled,false,trigger);
+  }
+});
+
+test('cancelled album work cannot clear a newer album session busy state',async()=>{
+  const first=deferred(),second=deferred();let calls=0;
+  const a=app({decode:()=>++calls===1?first.promise:second.promise});
+  const old=a.api.handleFile({size:10});await flush();a.get('resetAllBtn').handlers.click();
+  const next=a.api.handleFile({size:10});first.resolve(code('P009000'));await old;await flush();
+  assert.equal(a.get('albumBtn').disabled,true);
+  assert.equal(a.api.history().length,0);
+  second.resolve(code('P009001'));await next;await flush();
+  assert.equal(a.api.history()[0].code,'P009001');
+  assert.equal(a.get('albumBtn').disabled,false);
+});
+
+test('copy feedback reports the snapshot count even when history resets while copying',async()=>{
+  const pending=deferred(),a=app();let copied;
+  a.sandbox.navigator.clipboard={writeText:text=>{copied=text;return pending.promise;}};
+  a.api.setHistory([{code:'P009000'},{code:'P009001'}]);
+  a.get('copyAllBtn').handlers.click();a.get('resetAllBtn').handlers.click();
+  pending.resolve();await flush();
+  assert.equal(copied,'P009000\nP009001');
+  assert.match(a.get('status').textContent,/コピーしました（2件）/);
+});
+
+test('deleting a just-registered card clears its obsolete success notice',async()=>{
+  const a=app();a.api.addScan('P009000','手入力');await flush();
+  assert.equal(a.get('scanNotice').hidden,false);
+  descendants(a.get('histList')).find(n=>n.className==='del').onclick();
+  assert.equal(a.get('scanNotice').hidden,true);
+  assert.equal(a.api.history().length,0);
+});
+
+test('broken photo requests are replaced by an explicit fallback',()=>{
+  const a=app();a.api.setHistory([{code:'P009000',stock:{name:'test',head_picture_url:'/photos/missing.jpg'}}]);
+  const image=descendants(a.get('histList')).find(n=>n.className==='stock-photo');assert.ok(image);
+  image.onerror();
+  assert.equal(descendants(a.get('histList')).some(n=>n.className==='stock-photo'),false);
+  assert.ok(descendants(a.get('histList')).some(n=>/写真なし|写真を表示できません/.test(n.textContent)));
+});
+
+const response=(stock,status=200)=>({ok:status>=200&&status<300,status,json:async()=>stock});
+const item=(code,stock={name:'公開機械',detail_spec:'仕様'})=>({code,stock});
+
+test('opening a lower specification keeps its DOM, focus and scroll position',()=>{
+  const a=app();a.api.setHistory(['P009000','P009001','P009002'].map(code=>item(code)));
+  const rows=[...a.get('histList').children];const toggle=descendants(rows[2]).find(n=>n.className==='spec-toggle');
+  a.sandbox.window.scrollY=600;toggle.focus();toggle.onclick();
+  assert.deepEqual(a.get('histList').children,rows);assert.equal(a.sandbox.window.scrollY,600);
+  assert.equal(a.sandbox.document.activeElement,toggle);assert.equal(toggle.attributes['aria-expanded'],'true');
+  assert.equal(descendants(rows[2]).find(n=>n.className==='stock-spec').hidden,false);
+  a.events.resize();assert.deepEqual(a.get('histList').children,rows);
+});
+
+test('a stock completion cannot replace unrelated cards',async()=>{
+  const pending=deferred(),a=app({stockResponse:()=>pending.promise});
+  const items=['P009000','P009001','P009002'].map(code=>item(code));a.api.setHistory(items);
+  const third=a.get('histList').children[2];const loading=a.api.loadStock(items[0]);
+  pending.resolve(response({name:'updated'}));await loading;
+  assert.equal(a.get('histList').children[2],third);
+});
+
+test('history restoration normalizes codes, excludes invalid entries and deduplicates',()=>{
+  const a=app({storedHistory:[null,{},item(' p009000 '),item('P009000'),item('bad'),{code:'Ｐ００９００１',fmt:{bad:true}}]});
+  assert.equal(JSON.stringify(a.api.history()),JSON.stringify([{code:'P009000',fmt:''},{code:'P009001',fmt:''}]));
+});
+
+test('manual entry normalizes Japanese width and case and rejects invalid numbers',async()=>{
+  const a=app();a.get('manualInput').value=' ｐ００９ ０００ ';a.api.submitManual();await flush();
+  assert.equal(a.api.history()[0].code,'P009000');const count=a.requests.length;
+  for(const value of ['bad','1234567','P009000/foo','']){a.get('manualInput').value=value;a.api.submitManual();}
+  assert.equal(a.api.history().length,1);assert.equal(a.requests.length,count);
+});
+
+test('headers and JSON bodies both have a fifteen-second timeout',async()=>{
+  for(const stage of ['headers','body']){
+    const stalled=deferred();
+    const a=app({stockResponse:()=>stage==='headers'?stalled.promise:Promise.resolve({ok:true,status:200,json:()=>stalled.promise})});
+    a.api.addScan('P009000','手入力');await flush();
+    const timer=[...a.timers.values()].find(t=>t.ms===15000);assert.ok(timer,stage);timer.fn();await flush();
+    assert.equal(a.api.history()[0].stockLoading,false);assert.match(a.api.history()[0].stockError,/タイムアウト/);
+    assert.ok(descendants(a.get('histList')).some(n=>n.textContent==='再取得'));
+  }
+});
+
+test('a late older stock request cannot overwrite the latest response',async()=>{
+  const first=deferred(),second=deferred();let calls=0;
+  const a=app({stockResponse:()=>++calls===1?first.promise:second.promise});
+  const entry=item('P009000');a.api.setHistory([entry]);const old=a.api.loadStock(entry),latest=a.api.loadStock(entry);
+  second.resolve(response({name:'latest'}));await latest;first.resolve(response({name:'obsolete'}));await old;
+  assert.equal(entry.stock.name,'latest');assert.equal(entry.stockLoading,false);
+});
+
+test('deleted or reset entries ignore late public replies',async()=>{
+  for(const reset of [true,false]){
+    const pending=deferred(),a=app({stockResponse:()=>pending.promise});a.api.addScan('P009000','手入力');
+    if(reset)a.get('resetAllBtn').handlers.click();else descendants(a.get('histList')).find(n=>n.className==='del').onclick();
+    pending.resolve(response({name:'late'}));await flush();
+    assert.equal(a.api.history().length,0);assert.equal(a.get('histList').children.length,0);
+  }
+});
+
+test('public response rejects arrays and safely removes unexpected field types and all private fields',()=>{
+  const a=app();for(const value of [null,[],42])assert.throws(()=>a.api.publicStock(value),/形式が不正/);
+  const parsed=a.api.publicStock({name:{toString:1},memo:'PRIVATE',price:100,current_price:200,public_price:{toString:1}});
+  assert.equal(parsed.name,'');assert.equal(parsed.public_price,'');assert.equal(parsed.memo,undefined);assert.equal(parsed.price,undefined);
+  for(const bad of ['¥','￥, ','0x10','Infinity',{},null])assert.equal(a.api.formatPrice(bad),'');
+  assert.equal(a.api.formatPrice(0),'¥0');assert.equal(a.api.formatPrice('￥1,500,000'),'¥1,500,000');
+});
+
+test('initial history refresh limits simultaneous requests to three and does not delay decoder initialization',async()=>{
+  const pending=[];const a=app({storedHistory:Array.from({length:8},(_,i)=>({code:'P'+String(9000+i).padStart(6,'0')})),stockResponse:()=>{const d=deferred();pending.push(d);return d.promise;}});
+  let initialized=false;a.api.setInit(async()=>{initialized=true;});const startup=a.api.initialize();await flush();
+  assert.equal(initialized,true);assert.equal(a.requests.length,3);
+  for(let i=0;i<8;i++){await flush();assert.ok(pending[i]);pending[i].resolve(response({name:'fresh'}));}
+  await startup;assert.equal(a.requests.length,8);
+  assert.equal(a.api.history().every(item=>item.stock?.name==='fresh'&&!item.stockLoading),true);
+  for(const request of a.requests){assert.equal(request.options.credentials,'omit');assert.equal(request.options.headers.Authorization,undefined);}
+});
+
+test('clipboard fallback removes temporary fields even on errors and restores the original focus',async()=>{
+  const a=app();delete a.sandbox.navigator.clipboard;a.get('manualInput').focus();
+  a.sandbox.document.execCommand=()=>{throw new Error('blocked');};
+  await assert.rejects(a.api.copyText('P009000'),/blocked/);
+  assert.equal(a.sandbox.document.body.children.length,0);assert.equal(a.sandbox.document.activeElement,a.get('manualInput'));
+});
+
+
+test('cancelled photo work leaves a ready status when returning to the page',async()=>{
+  const pending=deferred(),a=app({decode:()=>pending.promise});
+  const work=a.api.handleFile({size:10});await flush();
+  a.sandbox.document.hidden=true;a.events.visibilitychange();
+  a.sandbox.document.hidden=false;a.events.visibilitychange();
+  pending.resolve(code('P009000'));await work;
+  assert.equal(a.get('status').textContent,'写真解析を中止しました');
+  assert.equal(a.get('led').className,'led ready');
+  assert.equal(a.api.history().length,0);
 });
