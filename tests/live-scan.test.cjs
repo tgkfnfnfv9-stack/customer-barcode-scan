@@ -655,10 +655,157 @@ test('automatic scanning exposes no camera controls and never changes zoom, ligh
 
 test('automatic camera setup leaves manual-only focus and exposure modes untouched',async()=>{
   const a=app();
-  a.camera.track.getCapabilities=()=>({focusMode:['manual','single-shot'],exposureMode:['manual'],focusDistance:{min:0,max:100},zoom:{min:1,max:8},torch:true});
+  a.camera.track.getCapabilities=()=>({focusMode:['manual'],exposureMode:['manual'],focusDistance:{min:0,max:100},zoom:{min:1,max:8},torch:true});
   await a.api.startScanner();await flush();
   assert.equal(a.camera.constraints.length,0,'unsupported continuous modes do not force manual camera settings');
   assert.ok(a.frameReads.length>0);
+  assert.equal(a.get('scanner').open,true);
+  a.api.stopScanner();
+});
+
+test('continuous autofocus remains preferred when one-shot focus is also available',async()=>{
+  const a=app();
+  a.camera.track.getCapabilities=()=>({focusMode:['manual','single-shot','continuous'],exposureMode:['continuous']});
+  a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>({pointsOfInterest:true});
+  await a.api.startScanner();await flush();
+  const added=a.camera.constraints.map(value=>value.advanced.at(-1));
+  assert.equal(added[0].focusMode,'continuous');
+  assert.equal(added.some(value=>value.focusMode==='single-shot'),false,'working continuous autofocus is never replaced by a one-shot sweep');
+  assert.deepEqual(JSON.parse(JSON.stringify(added.find(value=>value.pointsOfInterest).pointsOfInterest)),[{x:.5,y:.5}]);
+  assert.equal(a.camera.track.getSettings().focusMode,'continuous');
+  assert.equal(a.camera.track.getSettings().exposureMode,'continuous');
+  a.api.stopScanner();
+});
+
+test('supported one-shot autofocus runs once after exposure and center setup when continuous focus is unavailable',async()=>{
+  for(const unavailable of ['unsupported','rejected']){
+    const a=app(),calls=[];
+    a.camera.track.getCapabilities=()=>({focusMode:unavailable==='unsupported'?['manual','single-shot']:['manual','continuous','single-shot'],exposureMode:['continuous']});
+    a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>({pointsOfInterest:true});
+    const apply=a.camera.track.applyConstraints;
+    a.camera.track.applyConstraints=async value=>{
+      calls.push(value);
+      if(unavailable==='rejected'&&value.advanced.at(-1).focusMode==='continuous')throw new Error('driver rejected continuous autofocus');
+      await apply(value);
+    };
+    await a.api.startScanner();await flush();
+    const added=calls.map(value=>value.advanced.at(-1));
+    const expected=unavailable==='unsupported'?['exposureMode','pointsOfInterest','focusMode']:['focusMode','exposureMode','pointsOfInterest','focusMode'];
+    assert.deepEqual(added.map(value=>Object.keys(value)[0]),expected,unavailable);
+    assert.equal(added.at(-1).focusMode,'single-shot',unavailable+' focuses only after the target and exposure have been selected');
+    assert.equal(calls.filter(value=>value.advanced.some(option=>option.focusMode==='single-shot')).length,1,unavailable+' does not retrigger a single sweep through later constraints');
+    const final=Object.assign({},...calls.at(-1).advanced);
+    assert.equal(final.focusMode,'single-shot',unavailable);
+    assert.equal(final.exposureMode,'continuous',unavailable);
+    assert.deepEqual(JSON.parse(JSON.stringify(final.pointsOfInterest)),[{x:.5,y:.5}],unavailable);
+    for(const value of calls){
+      assert.equal(value.width?.ideal,1920,unavailable+' preserves the requested capture width');
+      assert.equal(value.height?.ideal,1080,unavailable+' preserves the requested capture height');
+    }
+    const count=calls.length;
+    await a.tick();await a.tick();
+    assert.equal(calls.length,count,unavailable+' does not hunt focus on every frame');
+    assert.equal(a.get('scanner').open,true);
+    a.api.stopScanner();
+  }
+});
+
+test('incomplete or stale autofocus settings reports do not replace an accepted continuous focus request',async()=>{
+  for(const unavailable of ['missing','throws','no focusMode','stale manual mode']){
+    const a=app();
+    a.camera.track.getCapabilities=()=>({focusMode:['continuous','single-shot'],exposureMode:['continuous']});
+    if(unavailable==='missing')delete a.camera.track.getSettings;
+    if(unavailable==='throws')a.camera.track.getSettings=()=>{throw new Error('settings unavailable');};
+    if(unavailable==='no focusMode')a.camera.track.getSettings=()=>({facingMode:'environment'});
+    if(unavailable==='stale manual mode')a.camera.track.getSettings=()=>({facingMode:'environment',focusMode:'manual'});
+    await a.api.startScanner();await flush();
+    assert.equal(a.camera.constraints[0].advanced.at(-1).focusMode,'continuous',unavailable);
+    assert.equal(a.camera.constraints.some(value=>value.advanced.some(option=>option.focusMode==='single-shot')),false,unavailable+' is not evidence of rejected autofocus');
+    assert.equal(a.get('scanner').open,true,unavailable);
+    assert.ok(a.frameReads.length>0,unavailable);
+    a.api.stopScanner();
+  }
+});
+
+test('center focus is skipped unless the browser explicitly advertises points of interest',async()=>{
+  for(const support of ['missing','false','absent','throws','truthy']){
+    const a=app();
+    a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous']});
+    if(support!=='missing')a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>{
+      if(support==='throws')throw new Error('constraint support unavailable');
+      return support==='absent'?{}:{pointsOfInterest:support==='truthy'?1:false};
+    };
+    await a.api.startScanner();await flush();
+    assert.equal(a.camera.constraints.length,2,support+' preserves ordinary focus and exposure setup');
+    assert.equal(a.camera.constraints.some(value=>value.advanced.some(option=>option.pointsOfInterest)),false,support);
+    assert.ok(a.frameReads.length>0,support);
+    a.api.stopScanner();
+  }
+});
+
+test('center focus is skipped when neither automatic focus mode is usable',async()=>{
+  for(const focus of ['manual only','unknown capabilities','continuous rejected']){
+    const a=app(),calls=[];
+    a.camera.track.getCapabilities=()=>({focusMode:focus==='manual only'?['manual']:focus==='continuous rejected'?['continuous']:undefined,exposureMode:['continuous']});
+    a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>({pointsOfInterest:true});
+    const apply=a.camera.track.applyConstraints;
+    a.camera.track.applyConstraints=async value=>{
+      calls.push(value);
+      if(value.advanced.at(-1).focusMode)throw new Error('autofocus unavailable');
+      await apply(value);
+    };
+    await a.api.startScanner();await flush();
+    assert.equal(calls.some(value=>value.advanced.some(option=>option.pointsOfInterest)),false,focus);
+    assert.equal(a.camera.track.getSettings().exposureMode,'continuous',focus+' does not suppress exposure');
+    assert.ok(a.frameReads.length>0,focus);
+    a.api.stopScanner();
+  }
+});
+
+test('rejected center focus cannot discard autofocus, exposure or barcode recognition',async()=>{
+  for(const focusMode of ['continuous','single-shot']){
+    const a=app({decode:async()=>code('P009000')}),calls=[];
+    a.camera.track.getCapabilities=()=>({focusMode:[focusMode],exposureMode:['continuous']});
+    a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>({pointsOfInterest:true});
+    const apply=a.camera.track.applyConstraints;
+    a.camera.track.applyConstraints=async value=>{
+      calls.push(value);
+      if(value.advanced.at(-1).pointsOfInterest)throw new Error('driver rejected focus point');
+      await apply(value);
+    };
+    await a.api.startScanner();await flush();
+    assert.equal(calls.filter(value=>value.advanced.at(-1).pointsOfInterest).length,1,focusMode);
+    assert.equal(a.camera.track.getSettings().focusMode,focusMode);
+    assert.equal(a.camera.track.getSettings().exposureMode,'continuous',focusMode);
+    assert.equal(a.camera.track.getSettings().pointsOfInterest,undefined,focusMode+' does not reapply rejected focus points');
+    if(focusMode==='single-shot')assert.equal(calls.at(-1).advanced.at(-1).focusMode,'single-shot','the one-shot sweep is still attempted after rejected points');
+    await a.tick();
+    assert.equal(a.api.history()[0]?.code,'P009000',focusMode);
+  }
+});
+
+test('a late center focus completion cannot trigger a one-shot sweep on an obsolete session',async()=>{
+  const pending=deferred(),a=app(),calls=[];
+  a.camera.track.getCapabilities=()=>({focusMode:['single-shot'],exposureMode:['continuous']});
+  a.sandbox.navigator.mediaDevices.getSupportedConstraints=()=>({pointsOfInterest:true});
+  const apply=a.camera.track.applyConstraints;
+  a.camera.track.applyConstraints=async value=>{
+    calls.push(value);
+    if(value.advanced.at(-1).pointsOfInterest)await pending.promise;
+    await apply(value);
+  };
+  await a.api.startScanner();await flush();
+  assert.ok(calls.some(value=>value.advanced.at(-1).pointsOfInterest),'center setup is pending');
+  assert.ok(a.frameReads.length>0,'optional center setup does not block barcode decoding');
+  a.api.stopScanner();
+  const next=stream();a.api.setMedia(async()=>next);
+  await a.api.startScanner();await flush();
+  const current=a.api.session();
+  pending.resolve();await flush();
+  assert.equal(calls.some(value=>value.advanced.some(option=>option.focusMode==='single-shot')),false,'stopped camera never receives a late focus trigger');
+  assert.equal(a.api.session(),current);
+  assert.equal(next.track.stopped,false);
+  assert.equal(next.constraints.length,0,'obsolete setup does not alter a newer camera');
   assert.equal(a.get('scanner').open,true);
   a.api.stopScanner();
 });
