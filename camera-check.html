@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>カメラ診断｜小林機械</title>
+<style>
+  :root{--orange:#EA5504;--ink:#161616;--muted:#6B7078;--line:#E4E6EA;--bg:#F4F5F7;--card:#fff;--red:#D24236;--green:#2E9E5B;
+    --sans:system-ui,-apple-system,"Hiragino Kaku Gothic ProN","Hiragino Sans",Meiryo,sans-serif;--mono:ui-monospace,Menlo,Consolas,monospace;}
+  *{box-sizing:border-box;}
+  body{margin:0;padding:16px;font-family:var(--sans);color:var(--ink);background:var(--bg);}
+  .wrap{max-width:560px;margin:0 auto;}
+  h1{font-size:20px;margin:0 0 8px;}
+  p{line-height:1.6;margin:8px 0;}
+  section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0;}
+  h2{font-size:16px;margin:0 0 8px;}
+  button,.file{display:block;width:100%;border:0;border-radius:10px;background:var(--orange);color:#fff;font:800 16px var(--sans);padding:14px;margin:8px 0;text-align:center;}
+  button.sub,.file.sub{background:#fff;color:var(--ink);border:1px solid var(--line);}
+  button:disabled{opacity:.5;}
+  .file input{display:none;}
+  #stage{position:relative;background:#000;border-radius:10px;overflow:hidden;display:none;aspect-ratio:3/4;}
+  #stage.on{display:block;}
+  #stage video{width:100%;height:100%;object-fit:contain;display:block;}
+  #guide{position:absolute;left:0;right:0;bottom:0;padding:12px;background:rgba(0,0,0,.65);color:#fff;font-weight:800;font-size:17px;line-height:1.45;text-align:center;}
+  #state{font-family:var(--mono);font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-all;}
+  #summary{font-size:14px;line-height:1.6;white-space:pre-wrap;}
+  textarea{width:100%;height:180px;font:11px var(--mono);border:1px solid var(--line);border-radius:8px;padding:8px;}
+  .ok{color:var(--green);font-weight:800;} .ng{color:var(--red);font-weight:800;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>カメラ診断（開発用）</h1>
+  <p>読み取り不具合の調査用ページです。スキャン画面とは別のページで、履歴や登録には一切影響しません。結果は端末内だけで作られ、自動送信はしません。</p>
+
+  <section>
+    <h2>1. ライブ映像の診断（約1分）</h2>
+    <p>読めないバーコードを1枚用意して、「診断を開始」を押してください。背面カメラを順に切り替えて、画面の指示どおりの距離で測ります。</p>
+    <button id="startBtn" disabled>準備中…</button>
+    <div id="stage"><video id="video" autoplay muted playsinline></video><div id="guide"></div></div>
+  </section>
+
+  <section>
+    <h2>2. 標準カメラ写真との比較</h2>
+    <p>同じバーコード・同じ明るさで、標準カメラ（またはアルバム）の写真を選んでください。同じ読取エンジンで解析します。</p>
+    <label class="file sub">写真を選ぶ<input type="file" id="photoInput" accept="image/*"></label>
+  </section>
+
+  <section>
+    <h2>3. 結果</h2>
+    <div id="summary">まだ結果はありません。</div>
+    <button id="copyBtn" class="sub" disabled>結果をコピー（テキスト）</button>
+    <button id="saveBtn" class="sub" disabled>比較画像を保存</button>
+    <textarea id="report" readonly></textarea>
+    <div id="state"></div>
+  </section>
+</div>
+<script type="module">
+const $=id=>document.getElementById(id);
+const video=$('video'), guide=$('guide'), stateEl=$('state'), summaryEl=$('summary');
+const report={tool:'camera-check v1',startedAt:new Date().toISOString(),page:location.href,env:{},app:{},cameras:[],nativePhotos:[]};
+const snapshots=[];
+// 自動テスト用に短縮できる。通常は指定しない。
+const params=new URLSearchParams(location.search);
+const PHASE_MS=Number(params.get('phaseMs'))||6000, PREPARE_MS=Number(params.get('prepareMs'))||2000;
+let readBarcodes=null, decoderQueue=Promise.resolve(), activeStream=null, running=false;
+
+function log(text){stateEl.textContent=text;}
+function show(){
+  $('report').value=JSON.stringify(report,null,1);
+  $('copyBtn').disabled=false;$('saveBtn').disabled=!snapshots.length;
+  const lines=[];
+  for(const camera of report.cameras){
+    lines.push(`■ ${camera.label||camera.deviceId||'不明'}${camera.appDefault?'（アプリが選ぶカメラ）':''}`);
+    if(camera.error){lines.push('  起動失敗: '+camera.error);continue;}
+    lines.push(`  映像 ${camera.videoWidth}×${camera.videoHeight} / AF: ${(camera.capabilities?.focusMode||['申告なし']).join(',')}`);
+    for(const phase of camera.phases||[]) lines.push(`  ${phase.name}: 読取 ${phase.hits}/${phase.decodes}回 鮮明度 ${phase.sharpnessBest??'-'}`);
+    if(camera.photo) lines.push(`  静止画: ${camera.photo.error?'失敗 '+camera.photo.error:(camera.photo.text?'読取 '+camera.photo.text:'読めず')+' '+(camera.photo.width||'?')+'×'+(camera.photo.height||'?')}${camera.photo.appSkipReason?' ※アプリでは不使用: '+camera.photo.appSkipReason:''}`);
+  }
+  if(report.aborted) lines.unshift('※ '+report.aborted+'（結果は不完全です）');
+  for(const photo of report.nativePhotos) lines.push(`■ 選んだ写真 ${photo.width}×${photo.height}: ${photo.text?'読取 '+photo.text:'読めず'} 鮮明度 ${photo.sharpness??'-'}`);
+  summaryEl.textContent=lines.join('\n')||'まだ結果はありません。';
+}
+
+/* ---- index.html と同じ読取設定・前処理（tests が一致を確認する） ---- */
+const MACHINE_CODE_RE=/^[A-Z][0-9]{6}$/;
+const READER_OPTS={
+  formats:['Code128','Code39'],
+  tryHarder:true,
+  tryRotate:true,
+  tryInvert:true,
+  tryDownscale:true,
+  downscaleFactor:2,
+  downscaleThreshold:1800,
+  tryDenoise:true,
+  minLineCount:1,
+  maxNumberOfSymbols:4,
+};
+function normalizeCode(value){return String(value??'').normalize('NFKC').toUpperCase().replace(/\s+/g,'');}
+function pickMachineBarcode(results){
+  for(const result of results||[]){
+    const code=normalizeCode(result&&result.text);
+    if(MACHINE_CODE_RE.test(code)) return {text:code,format:result.format||''};
+  }
+  return null;
+}
+function enhanceContrast(imageData){
+  const data=imageData.data, count=data.length/4;
+  if(!count) return imageData;
+  const gray=new Uint8Array(count), histogram=new Uint32Array(256);
+  for(let i=0,p=0;i<data.length;i+=4,p++){
+    const value=Math.round(data[i]*.299+data[i+1]*.587+data[i+2]*.114);
+    gray[p]=value;histogram[value]++;
+  }
+  // 固定の明るさを基準にせず、その銘板の明暗を使う。白飛び・黒潰れを避ける。
+  const tail=count*.001;
+  let low=0,high=255,total=0;
+  for(;low<255;low++){total+=histogram[low];if(total>tail)break;}
+  total=0;
+  for(;high>low;high--){total+=histogram[high];if(total>tail)break;}
+  if(high-low<8) return imageData; // ほぼ無地の映像ではノイズを増幅しない。
+  const midpoint=(low+high)/2, gain=Math.min(4,255/(high-low));
+  for(let i=0,p=0;i<data.length;i+=4,p++){
+    const value=Math.max(0,Math.min(255,Math.round((gray[p]-midpoint)*gain+128)));
+    data[i]=value;data[i+1]=value;data[i+2]=value;
+  }
+  return imageData;
+}
+function cameraFrameArea(width,height,fullFrame=false){
+  if(fullFrame){
+    return {sx:0,sy:0,sw:width,sh:height,
+      scale:Math.min(1,1920/Math.max(width,height),Math.sqrt(1200000/(width*height)))};
+  }
+  // 細いバーを縮小で消さないよう、中央の帯は元の画素のまま読む。
+  const sw=Math.min(width,3840);
+  const sh=Math.max(1,Math.min(Math.floor(height*.4),Math.floor(1200000/sw)));
+  return {sx:Math.floor((width-sw)/2),sy:Math.floor((height-sh)/2),sw,sh,scale:1};
+}
+async function cameraPhotoSize(blob){
+  // 要求サイズより大きいJPEGが返る端末もある。画像を展開する前に圧縮ヘッダーを確認する。
+  if(!blob || !Number.isFinite(blob.size) || blob.size<=0 || blob.size>12*1024*1024 || typeof blob.slice!=='function') return null;
+  const bytes=new Uint8Array(await blob.slice(0,256*1024).arrayBuffer());
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  let width=0,height=0;
+  if(bytes.length>=24 && bytes[0]===137 && bytes[1]===80 && bytes[2]===78 && bytes[3]===71 &&
+     bytes[4]===13 && bytes[5]===10 && bytes[6]===26 && bytes[7]===10 &&
+     bytes[12]===73 && bytes[13]===72 && bytes[14]===68 && bytes[15]===82){
+    width=view.getUint32(16);height=view.getUint32(20);
+  }else if(bytes[0]===255 && bytes[1]===216){
+    let offset=2;
+    while(offset+4<=bytes.length){
+      if(bytes[offset++]!==255) return null;
+      while(bytes[offset]===255) offset++;
+      const marker=bytes[offset++];
+      if(marker===217 || marker===218 || offset+2>bytes.length) break;
+      if(marker===1 || (marker>=208 && marker<=215)) continue;
+      const length=view.getUint16(offset);
+      if(length<2 || offset+length>bytes.length) return null;
+      if(marker>=192 && marker<=207 && ![196,200,204].includes(marker)){
+        if(length<8) return null;
+        height=view.getUint16(offset+3);width=view.getUint16(offset+5);break;
+      }
+      offset+=length;
+    }
+  }
+  return width>0 && height>0 && width<=8192 && height<=8192 && width*height<=8000000?{width,height}:null;
+}
+/* ---- ここまで ---- */
+
+function decode(input,options){
+  const result=decoderQueue.then(()=>readBarcodes(input,options));
+  decoderQueue=result.catch(()=>{});
+  return result;
+}
+const round=(value,digits=1)=>Number.isFinite(value)?Math.round(value*10**digits)/10**digits:value;
+function safe(fn){try{return JSON.parse(JSON.stringify(fn()??null));}catch(error){return 'error: '+(error?.name||error);}}
+// 端末識別子は比較に不要なため結果へ全桁を残さない。
+function trackInfo(fn){
+  const value=safe(fn);
+  if(value&&typeof value==='object') for(const key of ['deviceId','groupId']){
+    if(typeof value[key]==='string') value[key]=value[key].slice(0,12);
+    else if(typeof value[key]?.exact==='string') value[key]={exact:value[key].exact.slice(0,12)};
+  }
+  return value;
+}
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function timeout(promise,ms,label){
+  let timer;
+  return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(label+' timeout '+ms+'ms')),ms);})]).finally(()=>clearTimeout(timer));
+}
+
+// 対象範囲を幅640へ揃え、明暗差に対する最大級の横方向変化を測る相対値。
+// 同じカメラ・同じ解像度の段階どうしの比較用。縮小率が違う写真と映像の値は直接比べない。
+function sharpness(source,sx,sy,sw,sh){
+  const width=640, height=Math.max(1,Math.round(sh*width/sw));
+  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+  const context=canvas.getContext('2d',{willReadFrequently:true});
+  context.drawImage(source,sx,sy,sw,sh,0,0,width,height);
+  const data=context.getImageData(0,0,width,height).data;
+  const gray=new Uint8Array(width*height);
+  for(let i=0,p=0;i<data.length;i+=4,p++) gray[p]=(data[i]*299+data[i+1]*587+data[i+2]*114)/1000;
+  const sorted=Uint8Array.from(gray).sort();
+  const range=Math.max(1,sorted[Math.floor(sorted.length*.99)]-sorted[Math.floor(sorted.length*.01)]);
+  const gradients=new Uint8Array((width-1)*height);
+  let n=0;
+  for(let y=0;y<height;y++) for(let x=1;x<width;x++) gradients[n++]=Math.abs(gray[y*width+x]-gray[y*width+x-1]);
+  gradients.sort();
+  const value=Math.round(100*gradients[Math.floor(n*.995)]/range);
+  canvas.width=0;canvas.height=0;
+  return {value,range};
+}
+function keepSnapshot(label,source,sx,sy,sw,sh){
+  const width=480, height=Math.max(1,Math.round(sh*width/sw));
+  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+  canvas.getContext('2d').drawImage(source,sx,sy,sw,sh,0,0,width,height);
+  snapshots.push({label,canvas});
+}
+
+async function loadDecoder(){
+  const response=await fetch('./index.html',{cache:'no-store'});
+  const html=await response.text();
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(html));
+  report.app={indexSha256:[...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16),
+    indexBytes:html.length,lastModified:response.headers.get('last-modified')};
+  const block=id=>{
+    const match=html.match(new RegExp('<script id="'+id+'" type="application/base64">([^<]+)<\/script>'));
+    if(!match) throw new Error(id+' not found');
+    const bin=atob(match[1].trim()), bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    return bytes;
+  };
+  const url=URL.createObjectURL(new Blob([new TextDecoder().decode(block('zxjs'))],{type:'text/javascript'}));
+  try{
+    const mod=await import(url);
+    await mod.prepareZXingModule({overrides:{wasmBinary:block('zxwasm')},fireImmediately:true});
+    readBarcodes=mod.readBarcodes;
+  }finally{URL.revokeObjectURL(url);}
+}
+
+async function collectEnvironment(){
+  report.env.userAgent=navigator.userAgent;
+  report.env.screen={width:screen.width,height:screen.height,dpr:devicePixelRatio,orientation:screen.orientation?.type};
+  try{
+    report.env.uaData=await navigator.userAgentData?.getHighEntropyValues(['model','platform','platformVersion','fullVersionList']);
+  }catch(error){report.env.uaData='error: '+error?.name;}
+  report.env.supportedConstraints=safe(()=>navigator.mediaDevices.getSupportedConstraints());
+  report.env.imageCapture=typeof ImageCapture==='function';
+  report.env.frameCallback=typeof HTMLVideoElement.prototype.requestVideoFrameCallback==='function';
+}
+
+function stopStream(){
+  if(activeStream) activeStream.getTracks().forEach(track=>track.stop());
+  activeStream=null;video.srcObject=null;
+}
+
+// index.html の applyCameraSetting / configureCamera と同じ順序で設定し、結果と所要時間を記録する。
+async function configureLikeApp(track,camera,captureConstraints){
+  const steps=camera.configure=[];
+  let applied=null;
+  async function apply(setting){
+    const started=performance.now();
+    try{
+      let constraints=applied||captureConstraints||{};
+      if(!applied){try{constraints={...constraints,...track.getConstraints?.()};}catch{}}
+      const advanced=(constraints.advanced||[]).map(entry=>Object.fromEntries(Object.entries(entry).filter(([key])=>!(key in setting)))).filter(entry=>Object.keys(entry).length);
+      const next={...constraints,advanced:[...advanced,setting]};
+      await timeout(track.applyConstraints(next),8000,'applyConstraints');
+      applied=next;
+      steps.push({setting,ok:true,ms:Math.round(performance.now()-started),settingsAfter:trackInfo(()=>track.getSettings())});
+      return true;
+    }catch(error){
+      steps.push({setting,ok:false,ms:Math.round(performance.now()-started),error:(error?.name||'')+' '+(error?.message||'')});
+      return false;
+    }
+  }
+  const caps=camera.capabilities||{};
+  const focusModes=Array.isArray(caps.focusMode)?caps.focusMode:[];
+  let continuous=false;
+  if(focusModes.includes('continuous')) continuous=await apply({focusMode:'continuous'});
+  if(Array.isArray(caps.exposureMode)&&caps.exposureMode.includes('continuous')) await apply({exposureMode:'continuous'});
+  if((continuous||focusModes.includes('single-shot'))&&navigator.mediaDevices.getSupportedConstraints?.().pointsOfInterest===true) await apply({pointsOfInterest:[{x:0.5,y:0.5}]});
+  if(!continuous&&focusModes.includes('single-shot')) await apply({focusMode:'single-shot'});
+  return {apply,applied:()=>applied};
+}
+
+function nextFrame(lastTime){
+  return new Promise(resolve=>{
+    let done=false;
+    const finish=value=>{if(!done){done=true;resolve(value);}};
+    setTimeout(()=>finish(null),1500);
+    if(video.requestVideoFrameCallback) video.requestVideoFrameCallback((now,meta)=>finish({mediaTime:meta.mediaTime,presented:meta.presentedFrames,width:meta.width,height:meta.height}));
+    else{
+      const poll=()=>{if(done)return;if(video.currentTime!==lastTime)finish({mediaTime:video.currentTime});else setTimeout(poll,30);};
+      poll();
+    }
+  });
+}
+
+async function runPhase(camera,track,name,instruction,ms){
+  const phase={name,decodes:0,hits:0,results:[],decodeMs:[],sharpness:[],stalls:0,frames:0,muted:0};
+  camera.phases.push(phase);
+  guide.textContent=instruction+'（準備中）';
+  await wait(PREPARE_MS);
+  guide.textContent=instruction+'（測定中）';
+  phase.settingsStart=trackInfo(()=>track.getSettings());
+  const canvas=document.createElement('canvas');
+  const startedAt=performance.now();let pass=0,lastTime=-1,best=null,firstPresented=null,lastPresented=null;
+  while(running&&performance.now()-startedAt<ms){
+    const frame=await nextFrame(lastTime);
+    if(track.muted) phase.muted++;
+    if(!frame){phase.stalls++;continue;}
+    phase.frames++;lastTime=frame.mediaTime;
+    if(frame.presented!=null){firstPresented??=frame.presented;lastPresented=frame.presented;}
+    const width=video.videoWidth,height=video.videoHeight;
+    if(!width||!height) continue;
+    const center=cameraFrameArea(width,height);
+    const sharp=sharpness(video,center.sx,center.sy,center.sw,center.sh);
+    phase.sharpness.push(sharp.value);
+    if(!best||sharp.value>best.value){best=sharp;keepBestSnapshot(camera,name,center);}
+    const current=pass++%4;
+    const {sx,sy,sw,sh,scale}=cameraFrameArea(width,height,current>=2);
+    canvas.width=Math.max(1,Math.floor(sw*scale));canvas.height=Math.max(1,Math.floor(sh*scale));
+    const context=canvas.getContext('2d',{willReadFrequently:true});
+    context.drawImage(video,sx,sy,sw,sh,0,0,canvas.width,canvas.height);
+    let image=context.getImageData(0,0,canvas.width,canvas.height);
+    if(current%2===1) image=enhanceContrast(image);
+    const t0=performance.now();
+    let raw=[];
+    try{raw=await decode(image,{...READER_OPTS,tryDownscale:false});}catch(error){phase.decodeError=String(error?.message||error);}
+    const elapsed=Math.round(performance.now()-t0);
+    phase.decodes++;phase.decodeMs.push(elapsed);
+    const picked=pickMachineBarcode(raw);
+    if(picked) phase.hits++;
+    // フィルター前の結果も残し、形式・桁違いで捨てられていないか確認する。
+    if(raw.length||picked) phase.results.push({t:Math.round(performance.now()-startedAt),pass:['center','center+contrast','full','full+contrast'][current],
+      input:canvas.width+'x'+canvas.height,raw:raw.slice(0,4).map(r=>({text:r.text,format:r.format,valid:r.isValid})),picked:picked?.text||null});
+    // アプリと同じく、解析完了から220ms空けて次の新規フレームを読む。
+    await wait(220);
+  }
+  canvas.width=0;canvas.height=0;
+  phase.settingsEnd=trackInfo(()=>track.getSettings());
+  phase.presentedFrames=lastPresented!=null?lastPresented-firstPresented:null;
+  // 解析した枚数/秒（カメラ自体のフレーム数は presentedFrames）。
+  phase.analyzedPerSecond=round(phase.frames/(ms/1000));
+  phase.cameraFps=phase.presentedFrames!=null?round(phase.presentedFrames/((performance.now()-startedAt)/1000)):null;
+  phase.sharpnessBest=best?.value??null;phase.contrastRange=best?.range??null;
+  phase.sharpnessMedian=phase.sharpness.length?[...phase.sharpness].sort((a,b)=>a-b)[Math.floor(phase.sharpness.length/2)]:null;
+  phase.decodeMsMedian=phase.decodeMs.length?[...phase.decodeMs].sort((a,b)=>a-b)[Math.floor(phase.decodeMs.length/2)]:null;
+  // アプリの登録条件（別フレームで同じ番号を5秒以内に2回）を満たしたか。
+  const hits=phase.results.filter(r=>r.picked);
+  phase.appWouldRegister=hits.some((r,i)=>i>0&&hits[i-1].picked===r.picked&&r.t-hits[i-1].t<5000);
+  delete phase.sharpness;delete phase.decodeMs;
+  show();
+}
+function keepBestSnapshot(camera,name,area){
+  const label=(camera.label||camera.deviceId)+' / '+name;
+  const index=snapshots.findIndex(s=>s.label===label);
+  if(index>=0) snapshots.splice(index,1);
+  keepSnapshot(label,video,area.sx,area.sy,area.sw,area.sh);
+}
+
+async function analyzeImage(source,width,height,record,label){
+  const t0=performance.now();
+  // アプリと同じく、まずファイル全体を読んでから画像を展開する。
+  let result=pickMachineBarcode(await decode(source,READER_OPTS));
+  record.fullImage=!!result;
+  const bitmap=source instanceof Blob?await createImageBitmap(source):source;
+  try{
+    // index.html の scanDetailedAreas と同じ3帯を、未加工・明暗補正の順に読む。
+    for(const crop of [{y:.45,h:.55},{y:.225,h:.55},{y:0,h:.55}]){
+      if(result) break;
+      for(const contrast of [false,true]){
+        const sh=Math.round(height*crop.h), scale=Math.min(1,2400/Math.max(width,sh));
+        const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(width*scale));canvas.height=Math.max(1,Math.round(sh*scale));
+        const context=canvas.getContext('2d',{willReadFrequently:true});
+        context.drawImage(bitmap,0,Math.round(height*crop.y),width,sh,0,0,canvas.width,canvas.height);
+        let image=context.getImageData(0,0,canvas.width,canvas.height);
+        if(contrast) image=enhanceContrast(image);
+        result=pickMachineBarcode(await decode(image,{...READER_OPTS,tryDownscale:false}));
+        canvas.width=0;canvas.height=0;
+        if(result){record.band=crop.y+(contrast?'+contrast':'');break;}
+      }
+    }
+    const center=cameraFrameArea(width,height);
+    record.sharpness=sharpness(bitmap,center.sx,center.sy,center.sw,center.sh).value;
+    keepSnapshot(label,bitmap,center.sx,center.sy,center.sw,center.sh);
+    record.text=result?.text||null;
+  }finally{if(bitmap!==source&&bitmap.close)bitmap.close();}
+  record.analyzeMs=Math.round(performance.now()-t0);
+}
+
+// index.html の prepareCameraPhoto / captureCameraPhoto と同じ条件で静止画を1回取得する。
+async function testPhoto(camera,track){
+  const photo=camera.photo={};
+  if(typeof ImageCapture!=='function'){photo.error='ImageCapture非対応';return;}
+  try{
+    const capture=new ImageCapture(track);
+    const caps=await timeout(capture.getPhotoCapabilities(),5000,'getPhotoCapabilities');
+    photo.capabilities=safe(()=>({imageWidth:caps.imageWidth,imageHeight:caps.imageHeight,fillLightMode:caps.fillLightMode,redEyeReduction:caps.redEyeReduction}));
+    if(!Array.isArray(caps.fillLightMode)||!caps.fillLightMode.includes('off')) photo.appSkipReason='fillLightMode off なし';
+    const ranges=[caps.imageWidth,caps.imageHeight];
+    if(ranges.some(range=>!range||!Number.isFinite(range.min)||!Number.isFinite(range.max)||range.min<=0||range.max<range.min)){photo.appSkipReason=(photo.appSkipReason?photo.appSkipReason+' / ':'')+'画像サイズ範囲が無効';}
+    const settings={};
+    if(caps.fillLightMode?.includes('off')) settings.fillLightMode='off';
+    if(!ranges.some(range=>!range||!Number.isFinite(range.max)||range.max<=0)){
+      const scale=Math.min(1,2560/Math.max(caps.imageWidth.max,caps.imageHeight.max));
+      settings.imageWidth=Math.floor(caps.imageWidth.max*scale);settings.imageHeight=Math.floor(caps.imageHeight.max*scale);
+      if(settings.imageWidth<caps.imageWidth.min||settings.imageHeight<caps.imageHeight.min) photo.appSkipReason=(photo.appSkipReason?photo.appSkipReason+' / ':'')+'2560以下のサイズ非対応';
+    }
+    photo.requested=settings;
+    guide.textContent='いつもの距離のまま、静止画を撮影しています…';
+    const t0=performance.now();
+    const blob=await timeout(capture.takePhoto(settings),8000,'takePhoto');
+    photo.takeMs=Math.round(performance.now()-t0);
+    if(photo.takeMs>5000) photo.appSkipReason=(photo.appSkipReason?photo.appSkipReason+' / ':'')+'撮影応答5秒超（アプリは破棄）';
+    photo.bytes=blob.size;photo.type=blob.type;
+    photo.appHeaderSize=await cameraPhotoSize(blob);
+    if(!photo.appHeaderSize) photo.appSkipReason=(photo.appSkipReason?photo.appSkipReason+' / ':'')+'返却画像が12MiB/800万画素超または寸法不明（アプリは破棄）';
+    photo.appWouldUse=!photo.appSkipReason;
+    const bitmap=await createImageBitmap(blob);
+    photo.width=bitmap.width;photo.height=bitmap.height;bitmap.close?.();
+    // アプリと同じく、返却Blobをそのまま読取エンジンへ渡す。
+    await analyzeImage(blob,photo.width,photo.height,photo,(camera.label||camera.deviceId)+' / 静止画');
+    photo.trackAfter={muted:track.muted,readyState:track.readyState};
+  }catch(error){photo.error=(error?.name||'')+' '+(error?.message||'');}
+  show();
+}
+
+// 時間切れにはしない（許可ダイアログを待つ間も含むため）。届いたストリームは必ず activeStream で停止する。
+async function openCamera(videoConstraints,camera){
+  for(let attempt=0;;attempt++){
+    try{
+      try{return await navigator.mediaDevices.getUserMedia({audio:false,video:videoConstraints});}
+      catch(error){
+        // index.html と同じく、条件が合わない場合だけ向きの指定のみで再試行する。
+        if(error?.name!=='OverconstrainedError'||!videoConstraints.facingMode) throw error;
+        camera.overconstrainedFallback=true;
+        return await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:videoConstraints.facingMode}});
+      }
+    }catch(error){
+      // Android は前のカメラを非同期に解放するため、使用中エラーは1回だけ待って再試行する。
+      if(error?.name!=='NotReadableError'||attempt>0) throw error;
+      camera.notReadableRetry=true;await wait(1000);
+    }
+  }
+}
+
+async function testCamera(videoConstraints,camera){
+  report.cameras.push(camera);camera.phases=[];
+  try{
+    const t0=performance.now();
+    activeStream=await openCamera(videoConstraints,camera);
+    camera.openMs=Math.round(performance.now()-t0);
+    if(!running) throw new Error('中断されました');
+    const track=activeStream.getVideoTracks()[0];
+    camera.label=track.label;
+    camera.capabilitiesBeforePlay=trackInfo(()=>track.getCapabilities?.());
+    camera.settings=trackInfo(()=>track.getSettings());
+    camera.constraints=trackInfo(()=>track.getConstraints());
+    camera.deviceId=camera.deviceId||track.getSettings?.().deviceId;
+    track.addEventListener('mute',()=>{camera.muteEvents=(camera.muteEvents||0)+1;});
+    track.addEventListener('ended',()=>{camera.ended=true;});
+    video.srcObject=activeStream;
+    await timeout(video.play(),10000,'play');
+    for(let i=0;i<50&&!video.videoWidth;i++) await wait(100);
+    camera.videoWidth=video.videoWidth;camera.videoHeight=video.videoHeight;
+    // アプリは再生開始後に読む。Chrome Android では直後に空のことがあるため同じ時点で読む。
+    camera.capabilities=trackInfo(()=>track.getCapabilities?.());
+    if(!running) throw new Error('中断されました');
+    const configured=await configureLikeApp(track,camera,videoConstraints);
+    await runPhase(camera,track,'いつもの距離','いつもスキャンする距離で、バーコードを画面の中央に合わせてください',PHASE_MS);
+    if(running) await runPhase(camera,track,'20cm離す','スマホを20cmほど離して、バーコードを中央に合わせてください',PHASE_MS);
+    const zoom=camera.capabilities?.zoom;
+    if(running&&camera.appDefault&&zoom&&Number.isFinite(zoom.max)&&zoom.max>=2){
+      // 診断のみ：近づきすぎを避けた距離で画素を増やせるか比較する（アプリには未搭載）。
+      camera.zoomApplied=await configured.apply({zoom:2});
+      if(camera.zoomApplied) await runPhase(camera,track,'20cm＋ズーム2倍','20cm離したまま、バーコードを中央に合わせてください（拡大表示中）',PHASE_MS);
+      await configured.apply({zoom:zoom.min??1});
+    }
+    guide.textContent='いつもスキャンする距離に戻してください';
+    await wait(1500);
+    if(running) await testPhoto(camera,track);
+    camera.finalSettings=trackInfo(()=>track.getSettings());
+  }catch(error){camera.error=(error?.name||'')+' '+(error?.message||'');}
+  finally{stopStream();show();}
+}
+
+async function runDiagnosis(){
+  if(running) return;
+  running=true;$('startBtn').disabled=true;$('stage').classList.add('on');
+  snapshots.length=0;report.cameras=[];
+  try{
+    // index.html の startScanner と同じ要求で開く。
+    const selection={facingMode:{ideal:'environment'}};
+    const appConstraints={...selection,width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30},resizeMode:{ideal:'none'}};
+    await testCamera(appConstraints,{appDefault:true});
+    const devices=await navigator.mediaDevices.enumerateDevices();
+    report.devices=devices.filter(d=>d.kind==='videoinput').map(d=>({deviceId:d.deviceId.slice(0,12),label:d.label}));
+    const tested=new Set(report.cameras.map(c=>c.deviceId));
+    for(const device of devices){
+      if(!running) break;
+      if(device.kind!=='videoinput'||tested.has(device.deviceId)||/facing front|front|前面|インカメラ/i.test(device.label)) continue;
+      await testCamera({deviceId:{exact:device.deviceId},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30},resizeMode:{ideal:'none'}},{deviceId:device.deviceId,appDefault:false});
+    }
+    report.devicesAfter=report.cameras.map(c=>({label:c.label,deviceId:(c.deviceId||'').slice(0,12)}));
+    for(const camera of report.cameras) if(camera.deviceId) camera.deviceId=camera.deviceId.slice(0,12);
+    guide.textContent=report.aborted?'途中で中断しました。もう一度診断してください。':'診断が終わりました。下の「結果をコピー」と「比較画像を保存」を押してください。';
+  }catch(error){report.error=(error?.name||'')+' '+(error?.message||'');guide.textContent='診断を中断しました：'+report.error;}
+  finally{running=false;stopStream();$('startBtn').disabled=false;$('startBtn').textContent='もう一度診断する';report.finishedAt=new Date().toISOString();show();}
+}
+
+$('startBtn').addEventListener('click',runDiagnosis);
+$('photoInput').addEventListener('change',async event=>{
+  const file=event.target.files[0];event.target.value='';
+  if(!file||!readBarcodes) return;
+  const record={name:file.name.slice(-24),bytes:file.size,type:file.type,lastModified:new Date(file.lastModified).toISOString()};
+  report.nativePhotos.push(record);
+  log('写真を解析中…');
+  try{
+    const bitmap=await createImageBitmap(file);
+    record.width=bitmap.width;record.height=bitmap.height;bitmap.close?.();
+    // アルバム読取と同じく、まずファイル全体を読む。
+    await analyzeImage(file,record.width,record.height,record,'選んだ写真');
+  }catch(error){record.error=(error?.name||'')+' '+(error?.message||'');}
+  log('');show();
+});
+$('copyBtn').addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText($('report').value);log('コピーしました。LINEやメールに貼り付けて送ってください。');}
+  catch{$('report').select();log('自動コピーできませんでした。テキストを長押しして全選択・コピーしてください。');}
+});
+$('saveBtn').addEventListener('click',()=>{
+  const width=480, gap=28;
+  const height=snapshots.reduce((sum,s)=>sum+s.canvas.height+gap,0);
+  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=Math.max(1,height);
+  const context=canvas.getContext('2d');
+  context.fillStyle='#fff';context.fillRect(0,0,width,canvas.height);
+  let y=0;
+  for(const snapshot of snapshots){
+    context.fillStyle='#000';context.font='bold 16px sans-serif';context.fillText(snapshot.label,6,y+20);
+    context.drawImage(snapshot.canvas,0,y+gap);y+=snapshot.canvas.height+gap;
+  }
+  canvas.toBlob(blob=>{
+    const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='camera-check-'+Date.now()+'.jpg';
+    document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),10000);
+  },'image/jpeg',.9);
+});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&running){running=false;report.aborted='画面を離れたため中断';stopStream();}});
+
+collectEnvironment().then(show);
+loadDecoder().then(()=>{$('startBtn').disabled=false;$('startBtn').textContent='診断を開始';})
+  .catch(error=>{$('startBtn').textContent='読取エンジンを読み込めません';log(String(error?.message||error));});
+</script>
+</body>
+</html>
