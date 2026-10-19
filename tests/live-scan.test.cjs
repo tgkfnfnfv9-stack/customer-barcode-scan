@@ -406,6 +406,283 @@ test('cancelled photo work leaves a ready status when returning to the page',asy
   assert.equal(a.api.history().length,0);
 });
 
+// A still image supplements live scanning only after a bounded series of unsuccessful frames.
+async function flushPhoto(){for(let i=0;i<4;i++)await flush();}
+function cameraPhotoBlob(width=1920,height=1080){
+  // Only the JPEG size header is consumed here; browser tests use real encoded images.
+  const header=Uint8Array.of(255,216,255,192,0,17,8,height>>8,height&255,width>>8,width&255,3,1,17,0,2,17,0,3,17,0,255,217);
+  return new Blob([header],{type:'image/jpeg'});
+}
+function installPhotoCapture(a,{capabilities,getCapabilities,takePhoto}={}){
+  const calls=[],tracks=[];
+  a.sandbox.createImageBitmap=async()=>({width:1920,height:1080,close(){}});
+  a.sandbox.ImageCapture=class{
+    constructor(track){tracks.push(track);}
+    getPhotoCapabilities(){return getCapabilities?getCapabilities():Promise.resolve(capabilities||{
+      fillLightMode:['auto','off','flash'],imageWidth:{min:320,max:4000,step:1},imageHeight:{min:240,max:3000,step:1}
+    });}
+    takePhoto(settings){calls.push(settings);return takePhoto?takePhoto(settings,calls.length):Promise.resolve(cameraPhotoBlob());}
+  };
+  return {calls,tracks};
+}
+async function reachPhotoFallback(a){
+  await a.api.startScanner();await flushPhoto();a.api.advance(2000);
+  for(let i=0;i<3;i++)await a.tick();
+  await flushPhoto();
+}
+
+test('automatic still capture requires four failed fresh frames and two seconds, then keeps flash off within image bounds',async()=>{
+  const a=app(),capture=installPhotoCapture(a);
+  await a.api.startScanner();await flushPhoto();
+  await a.tick();await a.tick();
+  a.api.advance(2000);await a.tick({advance:false});
+  assert.equal(capture.calls.length,0,'time alone or reprocessing a frame cannot trigger capture');
+  await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,1);
+  assert.equal(capture.tracks[0],a.camera.track);
+  const settings=capture.calls[0];
+  assert.equal(settings.fillLightMode,'off');
+  assert.ok(settings.imageWidth>0&&settings.imageHeight>0);
+  assert.ok(Math.max(settings.imageWidth,settings.imageHeight)<=2560);
+  assert.ok(settings.imageWidth*settings.imageHeight<=5000000);
+  assert.equal(a.get('scanner').open,true);
+  assert.equal(a.camera.track.stopped,false);
+  a.api.stopScanner();
+
+  const early=app(),earlyCapture=installPhotoCapture(early);
+  await early.api.startScanner();await flushPhoto();
+  for(let i=0;i<4;i++)await early.tick();
+  early.api.advance(1999);await early.tick();
+  assert.equal(earlyCapture.calls.length,0,'enough frames do not bypass startup grace');
+  early.api.advance(1);await early.tick();await flushPhoto();
+  assert.equal(earlyCapture.calls.length,1);
+  early.api.stopScanner();
+});
+
+test('pending autofocus setup prevents still capture while ordinary frames continue decoding',async()=>{
+  const focus=deferred(),camera=stream({capabilities:{focusMode:['continuous']}});let frames=0;
+  camera.track.applyConstraints=()=>focus.promise;
+  const a=app({getUserMedia:async()=>camera,decode:async input=>{if(!(input instanceof Blob))frames++;return [];}}),capture=installPhotoCapture(a);
+  await a.api.startScanner();await flushPhoto();a.api.advance(3000);
+  for(let i=0;i<5;i++)await a.tick();
+  assert.ok(frames>=6);
+  assert.equal(capture.calls.length,0);
+  focus.resolve();await flushPhoto();await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,1);
+  a.api.stopScanner();
+});
+
+test('unsupported still capabilities and capability errors leave the regular scanner usable',async()=>{
+  const variants=[
+    {capabilities:{fillLightMode:['auto','flash'],imageWidth:{min:320,max:4000},imageHeight:{min:240,max:3000}}},
+    {capabilities:{fillLightMode:['off'],imageWidth:{min:4000,max:4000},imageHeight:{min:3000,max:3000}}},
+    {capabilities:{fillLightMode:['off'],imageWidth:{min:0,max:Infinity},imageHeight:{min:240,max:3000}}},
+    {getCapabilities:async()=>{throw new Error('unsupported');}}
+  ];
+  for(const variant of variants){
+    const a=app(),capture=installPhotoCapture(a,variant);await reachPhotoFallback(a);
+    assert.equal(capture.calls.length,0);
+    assert.equal(a.get('scanner').open,true);
+    a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+    assert.equal(a.api.history()[0].code,'P009002');
+  }
+});
+
+test('still confirmation requires two separate captures and is not combined with a live candidate',async()=>{
+  let liveReads=0;const photos=[];
+  const a=app({decode:async input=>{
+    if(input instanceof Blob){photos.push(input);return code('P009002');}
+    return ++liveReads===1?code('P009002'):[];
+  }}),capture=installPhotoCapture(a);
+  await a.api.startScanner();await flushPhoto();a.api.advance(2000);
+  for(let i=0;i<4;i++)await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,1);
+  assert.equal(photos.length,1);
+  assert.equal(a.api.history().length,0,'one live image and one still image are not independent still confirmation');
+  a.api.advance(1499);await a.tick();assert.equal(capture.calls.length,1);
+  a.api.advance(1);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,2);
+  assert.equal(photos.length,2);
+  assert.notEqual(photos[0],photos[1]);
+  assert.equal(a.api.history().length,1);
+  assert.equal(a.api.history()[0].code,'P009002');
+  assert.equal(a.requests.length,1);
+  assert.equal(a.camera.track.stopped,true);
+  assert.equal(a.get('scanner').open,false);
+  assert.equal(a.timers.size,0);
+});
+
+test('expired still candidates require two new captures before registering',async()=>{
+  const a=app({decode:async input=>input instanceof Blob?code('P009002'):[]}),capture=installPhotoCapture(a);
+  await reachPhotoFallback(a);assert.equal(capture.calls.length,1);
+  a.api.advance(10000);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,2);
+  assert.equal(a.api.history().length,0);
+  a.api.advance(1500);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,3);
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('pending still capture and decode never stack another capture and cooldown begins after completion',async()=>{
+  const capturePending=deferred(),decodePending=deferred();let photoReads=0,frameReads=0;
+  const a=app({decode:input=>{
+    if(input instanceof Blob){photoReads++;return decodePending.promise;}
+    frameReads++;return Promise.resolve([]);
+  }}),capture=installPhotoCapture(a,{takePhoto:(_,call)=>call===1?capturePending.promise:Promise.resolve(cameraPhotoBlob())});
+  await reachPhotoFallback(a);assert.equal(capture.calls.length,1);
+  a.api.advance(2000);for(let i=0;i<3;i++)await a.tick();
+  assert.equal(capture.calls.length,1);
+  assert.ok(frameReads>=7,'video frames continue while hardware capture is pending');
+  capturePending.resolve(cameraPhotoBlob());await flushPhoto();assert.equal(photoReads,1);
+  // A queued video decode can wait behind the still decoder; invoke without awaiting it.
+  const decoding=a.tick();await flushPhoto();a.api.advance(2000);
+  assert.equal(capture.calls.length,1);
+  decodePending.resolve([]);await decoding;await flushPhoto();
+  assert.equal(capture.calls.length,1);
+  a.api.advance(1499);await a.tick();assert.equal(capture.calls.length,1);
+  a.api.advance(1);await a.tick();await flushPhoto();assert.equal(capture.calls.length,2);
+  a.api.stopScanner();
+});
+
+test('unreadable still images have a strict session attempt limit while video scanning continues',async()=>{
+  const a=app(),capture=installPhotoCapture(a);await reachPhotoFallback(a);
+  for(let i=0;i<6;i++){a.api.advance(1500);await a.tick();await flushPhoto();}
+  assert.equal(capture.calls.length,3);
+  assert.equal(a.get('scanner').open,true);
+  assert.equal(a.camera.track.stopped,false);
+  a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('optional still capture errors disable that path without counting as live decoder errors',async()=>{
+  const a=app(),capture=installPhotoCapture(a,{takePhoto:async()=>{throw new Error('camera busy');}});
+  await reachPhotoFallback(a);
+  for(let i=0;i<4;i++){a.api.advance(2000);await a.tick();}
+  assert.equal(capture.calls.length,1);
+  assert.equal(a.get('scanner').open,true);
+  assert.equal(a.api.session().errors,0);
+  a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('a hung still capture times out without stacking another request or accepting its late result',async()=>{
+  const pending=deferred();let photoReads=0;
+  const a=app({decode:async input=>{if(input instanceof Blob)photoReads++;return [];} }),capture=installPhotoCapture(a,{takePhoto:()=>pending.promise});
+  await reachPhotoFallback(a);
+  const timeout=[...a.timers].find(([,timer])=>timer.ms===5000);
+  assert.ok(timeout,'still capture has a bounded timeout');
+  a.timers.delete(timeout[0]);a.api.advance(5000);timeout[1].fn();await flushPhoto();
+  for(let i=0;i<3;i++){a.api.advance(2000);await a.tick();}
+  assert.equal(capture.calls.length,1);
+  assert.equal(a.get('scanner').open,true);
+  pending.resolve(cameraPhotoBlob());await flushPhoto();
+  assert.equal(photoReads,0);
+  assert.equal(a.api.history().length,0);
+  a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('stopping during still capture releases resources and late capture cannot interfere with a new session',async()=>{
+  const pending=deferred();let photoReads=0;
+  const a=app({decode:async input=>{if(input instanceof Blob)photoReads++;return [];}});
+  const capture=installPhotoCapture(a,{takePhoto:()=>pending.promise});await reachPhotoFallback(a);
+  assert.equal(capture.calls.length,1);a.api.stopScanner();
+  assert.equal(a.timers.size,0);
+  assert.equal(a.camera.track.stopped,true);
+  const next=stream();a.api.setMedia(async()=>next);
+  await a.api.startScanner();await flushPhoto();
+  pending.resolve(cameraPhotoBlob());await flushPhoto();
+  assert.equal(photoReads,0);
+  assert.equal(a.api.history().length,0);
+  assert.equal(a.get('scanner').open,true);
+  assert.equal(next.track.stopped,false);
+  a.api.stopScanner();assert.equal(a.timers.size,0);
+});
+
+test('stopping during still decoding ignores a matching confirmation result',async()=>{
+  const pending=deferred();let photoReads=0;
+  const a=app({decode:input=>input instanceof Blob?(++photoReads===1?Promise.resolve(code('P009002')):pending.promise):Promise.resolve([])});
+  const capture=installPhotoCapture(a);await reachPhotoFallback(a);
+  a.api.advance(1500);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,2);assert.equal(photoReads,2);
+  a.api.stopScanner();pending.resolve(code('P009002'));await flushPhoto();
+  assert.equal(a.api.history().length,0);
+  assert.equal(a.requests.length,0);
+  assert.equal(a.timers.size,0);
+});
+
+test('malformed or excessive still images are rejected before decoder allocation and do not break video scanning',async()=>{
+  const blobs=[new Blob(['not an image'],{type:'image/jpeg'}),cameraPhotoBlob(5000,4000),new Blob([new Uint8Array(12*1024*1024+1)],{type:'image/jpeg'})];
+  for(const blob of blobs){
+    let photoReads=0;
+    const a=app({decode:async input=>{if(input instanceof Blob)photoReads++;return [];}}),capture=installPhotoCapture(a,{takePhoto:async()=>blob});
+    await reachPhotoFallback(a);a.api.advance(2000);await a.tick();await flushPhoto();
+    assert.equal(capture.calls.length,1);
+    assert.equal(photoReads,0);
+    assert.equal(a.api.history().length,0);
+    assert.equal(a.get('scanner').open,true);
+    a.api.stopScanner();
+  }
+});
+
+test('cropped passes from one still image count as one confirmation and release their bitmap',async()=>{
+  const bitmaps=[];
+  const a=app({decode:async input=>!(input instanceof Blob)&&input.width===1920?code('P009002'):[]}),capture=installPhotoCapture(a);
+  a.sandbox.createImageBitmap=async()=>{const bitmap={width:1920,height:1080,closed:false,close(){this.closed=true;}};bitmaps.push(bitmap);return bitmap;};
+  await reachPhotoFallback(a);
+  assert.equal(capture.calls.length,1);
+  assert.equal(bitmaps.length,1);
+  assert.equal(bitmaps[0].closed,true);
+  assert.equal(a.api.history().length,0);
+  a.api.advance(1500);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,2);
+  assert.equal(bitmaps.length,2);
+  assert.equal(bitmaps.every(bitmap=>bitmap.closed),true);
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('transient capture mute is tolerated and unmuting prevents an obsolete camera-stop timer',async()=>{
+  const pending=deferred(),a=app();installPhotoCapture(a,{takePhoto:()=>pending.promise});
+  await reachPhotoFallback(a);
+  a.camera.track.muted=true;a.camera.listeners.mute();
+  assert.equal([...a.timers.values()].some(timer=>timer.ms===3000),false);
+  a.api.advance(3000);
+  assert.equal(a.get('scanner').open,true);
+  a.camera.track.muted=false;a.camera.listeners.unmute();
+  pending.resolve(cameraPhotoBlob());await flushPhoto();
+  assert.equal([...a.timers.values()].some(timer=>timer.ms===3000),false);
+  assert.equal(a.get('scanner').open,true);
+  a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
+test('permanent capture mute still stops the scanner after the bounded capture grace and normal watchdog',async()=>{
+  const pending=deferred(),a=app();installPhotoCapture(a,{takePhoto:()=>pending.promise});
+  await reachPhotoFallback(a);
+  a.camera.track.muted=true;a.camera.listeners.mute();
+  const timeout=[...a.timers].find(([,timer])=>timer.ms===5000);assert.ok(timeout);
+  a.timers.delete(timeout[0]);a.api.advance(5000);timeout[1].fn();await flushPhoto();
+  const muteTimeout=[...a.timers].find(([,timer])=>timer.ms===3000);assert.ok(muteTimeout);
+  a.timers.delete(muteTimeout[0]);a.api.advance(3000);muteTimeout[1].fn();await flushPhoto();
+  assert.equal(a.get('scanner').open,false);
+  assert.equal(a.camera.track.stopped,true);
+  assert.equal(a.api.history().length,0);
+  assert.equal(a.timers.size,0);
+  pending.resolve(cameraPhotoBlob());await flushPhoto();
+  assert.equal(a.get('scanner').open,false);
+  assert.equal(a.api.history().length,0);
+});
+
+test('still decoder failure disables only still capture and regular frames can subsequently succeed',async()=>{
+  const a=app({decode:async input=>{if(input instanceof Blob)throw new Error('bad still image');return [];}}),capture=installPhotoCapture(a);
+  await reachPhotoFallback(a);a.api.advance(2000);await a.tick();await flushPhoto();
+  assert.equal(capture.calls.length,1);
+  assert.equal(a.api.session().errors,0);
+  assert.equal(a.get('scanner').open,true);
+  a.api.setDecoder(async()=>code('P009002'));await a.tick();await a.tick();
+  assert.equal(a.api.history()[0].code,'P009002');
+});
+
 // Camera acquisition and frame-processing regressions shared by customer and staff scanners.
 test('camera requests sensor-oriented rear video independent of viewport orientation',async()=>{
   for(const portrait of [true,false]){
