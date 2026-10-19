@@ -10,7 +10,7 @@ const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 const instrumented=html.replace('readBarcodes=mod.readBarcodes;',`readBarcodes=async (input,options)=>{
   const results=await mod.readBarcodes(input,options);
   window.__decodes.push({width:input.width,height:input.height,texts:results.map(result=>result.text)});
-  if(window.__cameraTest.holdDecode) await new Promise(resolve=>{window.__cameraTest.releaseDecode=resolve;});
+  if(window.__cameraTest.holdDecodeAt===window.__decodes.length) await new Promise(resolve=>{window.__cameraTest.releaseDecode=resolve;});
   return results;
 };`);
 let server,url,browser;
@@ -31,7 +31,7 @@ async function fixture(t,options={}){
   t.after(()=>context.close());
   await context.addInitScript(options=>{
     window.__decodes=[];
-    const state=window.__cameraTest={streams:[],requests:[],constraints:[],holdDecode:false};
+    const state=window.__cameraTest={streams:[],requests:[],constraints:[],holdDecodeAt:options.holdDecodeAt};
     // Test-only Code 39 generator: nine alternating bars/spaces, 3:1 wide:narrow.
     const patterns={'*':0x094,P:0x052,0:0x034,9:0x064,1:0x121,2:0x061};
     function draw(canvas,frame){
@@ -182,12 +182,12 @@ test('unsupported camera controls stay hidden and optional constraints cannot pr
 });
 
 test('a real decode completed after close cannot register or revive the camera',async t=>{
-  const page=await fixture(t);
-  await page.evaluate(()=>{window.__cameraTest.holdDecode=true;});
+  const page=await fixture(t,{holdDecodeAt:2});
   await start(page);
   await page.waitForFunction(()=>typeof window.__cameraTest.releaseDecode==='function');
+  assert.equal(await page.evaluate(()=>window.__decodes.filter(frame=>frame.texts.includes('P009000')).length),2,'hold the confirming result after two actual reads');
   await page.locator('#closeScanner').click();
-  await page.evaluate(()=>{window.__cameraTest.holdDecode=false;window.__cameraTest.releaseDecode();});
+  await page.evaluate(()=>window.__cameraTest.releaseDecode());
   await page.waitForTimeout(300);
   assert.equal(await page.locator('#histList .row').count(),0);
   assert.equal(await page.locator('#scanner').evaluate(dialog=>dialog.open),false);
