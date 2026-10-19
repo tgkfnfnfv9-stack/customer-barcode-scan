@@ -7,7 +7,7 @@ const {chromium}=require('playwright');
 
 const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 // Observe the actual embedded WASM reader without substituting its results.
-const instrumented=html.replace('readBarcodes=mod.readBarcodes;',`window.__originalReader=mod.readBarcodes;window.__readerOptions=READER_OPTS;window.__enhanceContrast=enhanceContrast;
+const instrumented=html.replace('readBarcodes=mod.readBarcodes;',`window.__originalReader=mod.readBarcodes;window.__readerOptions=READER_OPTS;window.__enhanceContrast=enhanceContrast;window.__cameraFrameArea=cameraFrameArea;
 readBarcodes=async (input,options)=>{
   const results=await mod.readBarcodes(input,options);
   window.__decodes.push({width:input.width,height:input.height,texts:results.map(result=>result.text)});
@@ -32,24 +32,25 @@ async function fixture(t,options={}){
   t.after(()=>context.close());
   await context.addInitScript(options=>{
     window.__decodes=[];
-    const state=window.__cameraTest={streams:[],requests:[],constraints:[],holdDecodeAt:options.holdDecodeAt};
+    const state=window.__cameraTest={streams:[],requests:[],constraints:[],photos:[],photoInstances:[],activePhotos:0,maxActivePhotos:0,holdDecodeAt:options.holdDecodeAt};
     // Test-only Code 39 generator: nine alternating bars/spaces, 3:1 wide:narrow.
     const patterns={'*':0x094,P:0x052,0:0x034,9:0x064,1:0x121,2:0x061};
-    function picture(){
+    function picture(overrides={}){
+      const config={...options,...overrides};
       const canvas=document.createElement('canvas');
-      canvas.width=options.width||1920;canvas.height=options.height||1080;
+      canvas.width=config.width||1920;canvas.height=config.height||1080;
       const ctx=canvas.getContext('2d');
-      const light=options.light??(options.lowContrast?162:255),dark=options.dark??(options.lowContrast?112:0);
+      const light=config.light??(config.lowContrast?162:255),dark=config.dark??(config.lowContrast?112:0);
       ctx.fillStyle=`rgb(${light},${light},${light})`;
       ctx.fillRect(0,0,canvas.width,canvas.height);
-      if(!options.blank){
+      if(!config.blank){
         const bars=document.createElement('canvas');bars.width=canvas.width;bars.height=canvas.height;
         const barContext=bars.getContext('2d');
-        const narrow=options.narrow||3,code='*P009000*';
+        const narrow=config.narrow||3,code='*P009000*';
         const barWidth=(code.length*16-1)*narrow;
         let x=Math.floor((canvas.width-barWidth)/2);
-        const height=options.edge?Math.max(70,Math.floor(canvas.height*.08)):140;
-        const y=options.edge?Math.floor(canvas.height*.04):Math.floor((canvas.height-height)/2);
+        const height=config.edge?Math.max(70,Math.floor(canvas.height*.08)):140;
+        const y=config.edge?Math.floor(canvas.height*.04):Math.floor((canvas.height-height)/2);
         barContext.fillStyle=`rgb(${dark},${dark},${dark})`;
         for(const char of code){
           for(let i=0;i<9;i++){
@@ -59,17 +60,43 @@ async function fixture(t,options={}){
           }
           x+=narrow;
         }
-        ctx.filter=`blur(${options.blur||0}px)`;ctx.drawImage(bars,0,0);ctx.filter='none';
+        ctx.filter=`blur(${config.blur||0}px)`;ctx.drawImage(bars,0,0);ctx.filter='none';
       }
       return canvas;
     }
     state.picture=picture;
-    const fixturePicture=picture();
+    let fixturePicture=picture();
+    state.sharpenLive=()=>{fixturePicture=picture({blur:0,blank:false});state.push();};
     function draw(canvas,frame){
       const ctx=canvas.getContext('2d');ctx.drawImage(fixturePicture,0,0);
       // Ensure every requested frame has a distinct image/timestamp.
       ctx.fillStyle=frame%2?'#e1e1e1':'#eeeeee';ctx.fillRect(0,0,2,2);
     }
+    // Canvas streams supply actual video frames; only the hardware photo API is replaced.
+    window.ImageCapture=options.photoCapture?class {
+      constructor(track){this.track=track;state.photoInstances.push(track);}
+      async getPhotoCapabilities(){
+        if(options.rejectPhotoCapabilities)throw new DOMException('Photo capture unsupported','NotSupportedError');
+        return {
+          imageWidth:{min:640,max:4000,current:1920,step:1},
+          imageHeight:{min:480,max:3000,current:1080,step:1},
+          fillLightMode:options.noPhotoFlashOff?['auto','flash']:['off','auto','flash'],
+        };
+      }
+      async takePhoto(settings){
+        const entry={settings,startedAt:Date.now(),endedAt:null,liveDecodes:window.__decodes.length,trackLive:this.track.readyState==='live'};
+        state.photos.push(entry);state.activePhotos++;
+        state.maxActivePhotos=Math.max(state.maxActivePhotos,state.activePhotos);
+        try{
+          if(options.rejectPhotoCapture)throw new DOMException('Hardware photo unavailable','NotSupportedError');
+          if(options.holdPhotoAt===state.photos.length)await new Promise(resolve=>{state.releasePhoto=resolve;});
+          const canvas=picture({blank:false,blur:0,width:settings.imageWidth||1920,height:settings.imageHeight||1080});
+          const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.96));
+          entry.mimeType=blob.type;entry.bytes=blob.size;
+          return blob;
+        }finally{state.activePhotos--;entry.endedAt=Date.now();}
+      }
+    }:undefined;
     navigator.mediaDevices.enumerateDevices=async()=>[
       {kind:'videoinput',deviceId:'rear-main',label:'Back Camera'},
       {kind:'videoinput',deviceId:'rear-tele',label:'Back Telephoto Camera'},
@@ -78,7 +105,7 @@ async function fixture(t,options={}){
     const supportedConstraints=navigator.mediaDevices.getSupportedConstraints();
     navigator.mediaDevices.getSupportedConstraints=()=>({...supportedConstraints,pointsOfInterest:options.pointsOfInterest===true});
     navigator.mediaDevices.getUserMedia=async constraints=>{
-      state.requests.push(constraints);
+      state.requests.push(constraints);state.startedAt=Date.now();
       const canvas=document.createElement('canvas');
       canvas.width=options.width||1920;canvas.height=options.height||1080;draw(canvas,0);
       const stream=canvas.captureStream(0),track=stream.getVideoTracks()[0];
@@ -301,4 +328,61 @@ test('a real decode completed after close cannot register or revive the camera',
   assert.equal(await page.locator('#histList .row').count(),0);
   assert.equal(await page.locator('#scanner').evaluate(dialog=>dialog.open),false);
   assert.equal(await page.evaluate(()=>window.__cameraTest.streams.every(entry=>entry.track.readyState==='ended')),true);
+});
+
+
+async function currentCameraPasses(page){
+  return page.evaluate(async()=>{
+    const source=window.__cameraTest.picture(),results=[];
+    for(let pass=0;pass<4;pass++){
+      const {sx,sy,sw,sh,scale}=window.__cameraFrameArea(source.width,source.height,pass>=2);
+      const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.floor(sw*scale));canvas.height=Math.max(1,Math.floor(sh*scale));
+      const context=canvas.getContext('2d');context.drawImage(source,sx,sy,sw,sh,0,0,canvas.width,canvas.height);
+      let frame=context.getImageData(0,0,canvas.width,canvas.height);
+      if(pass%2===1)frame=window.__enhanceContrast(frame);
+      results.push((await window.__originalReader(frame,{...window.__readerOptions,tryDownscale:false})).map(result=>result.text));
+    }
+    return results;
+  });
+}
+
+test('automatic sharp JPEG fallback reads a barcode missed by all current blurred-video passes and requires separate photos',async t=>{
+  const page=await fixture(t,{narrow:2,blur:4,photoCapture:true,holdPhotoAt:2});
+  assert.deepEqual(await currentCameraPasses(page),[[],[],[],[]],'all current raw/enhanced central/full video passes miss this blurred barcode');
+  await start(page);
+  await page.waitForFunction(()=>typeof window.__cameraTest.releasePhoto==='function',null,{timeout:15000});
+  const first=await page.evaluate(()=>({photos:window.__cameraTest.photos,decodes:window.__decodes,startedAt:window.__cameraTest.startedAt}));
+  assert.equal(first.photos.length,2,'a second distinct hardware capture is requested');
+  assert.ok(first.photos[0].liveDecodes>=4,'the automatic fallback waits for the four live passes');
+  assert.ok(first.photos[0].startedAt-first.startedAt>=1900,'normal live decoding gets an initial opportunity');
+  assert.ok(first.photos[1].startedAt-first.photos[0].endedAt>=1400,'captures wait between completed attempts');
+  assert.equal(await page.locator('#histList .row').count(),0,'one photo cannot self-confirm through repeated processing');
+  assert.equal(await page.locator('#scanner').evaluate(dialog=>dialog.open),true);
+  assert.ok(first.decodes.some(frame=>frame.texts.includes('P009000')),'the first JPEG was already decoded by actual WASM');
+  await page.evaluate(()=>window.__cameraTest.releasePhoto());
+  await waitForRegistration(page);
+  const state=await page.evaluate(()=>({requests:window.__cameraTest.requests.length,photos:window.__cameraTest.photos,maxActive:window.__cameraTest.maxActivePhotos}));
+  assert.equal(state.requests,1,'the original live stream is reused');
+  assert.equal(state.photos.length,2,'two independently captured photos confirm the barcode');
+  assert.equal(state.maxActive,1,'hardware captures never overlap');
+  for(const photo of state.photos){
+    assert.equal(photo.mimeType,'image/jpeg');assert.ok(photo.bytes>0);assert.equal(photo.trackLive,true);
+    assert.deepEqual(photo.settings,{fillLightMode:'off',imageWidth:2560,imageHeight:1920},'capture is bounded and never enables flash');
+  }
+});
+
+test('unavailable still photos preserve live decoding without reopening or stopping the camera',async t=>{
+  for(const photoOptions of [{rejectPhotoCapture:true},{noPhotoFlashOff:true}]){
+    const page=await fixture(t,{narrow:2,blur:4,photoCapture:true,...photoOptions});
+    await start(page);
+    if(photoOptions.rejectPhotoCapture)await page.waitForFunction(()=>window.__cameraTest.photos.length===1,null,{timeout:10000});
+    else await page.waitForFunction(()=>window.__cameraTest.photoInstances.length===1&&window.__decodes.length>=10&&Date.now()-window.__cameraTest.startedAt>=2500,null,{timeout:10000});
+    assert.equal(await page.locator('#scanner').evaluate(dialog=>dialog.open),true);
+    assert.equal(await page.evaluate(()=>window.__cameraTest.streams[0].track.readyState),'live');
+    if(photoOptions.noPhotoFlashOff)assert.equal(await page.evaluate(()=>window.__cameraTest.photos.length),0,'capture is skipped if flash cannot be disabled');
+    await page.evaluate(()=>window.__cameraTest.sharpenLive());
+    await waitForRegistration(page);
+    assert.equal(await page.evaluate(()=>window.__cameraTest.requests.length),1,'live scanning continues on the same stream');
+    assert.equal(await page.evaluate(()=>window.__cameraTest.photos.length),photoOptions.rejectPhotoCapture?1:0,'failed or unsupported photo capture is not retried');
+  }
 });

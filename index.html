@@ -539,15 +539,17 @@ async function scanCrop(source,crop,highContrast){
   const canvas=document.createElement('canvas');
   canvas.width=Math.max(1,Math.round(sw*scale));
   canvas.height=Math.max(1,Math.round(sh*scale));
-  const context=canvas.getContext('2d',{willReadFrequently:true});
-  context.drawImage(source,sx,sy,sw,sh,0,0,canvas.width,canvas.height);
-  let imageData=context.getImageData(0,0,canvas.width,canvas.height);
-  if(highContrast) imageData=enhanceContrast(imageData);
-  const results=await decodeBarcodes(imageData,{...READER_OPTS,tryDownscale:false});
-  return pickMachineBarcode(results);
+  try{
+    const context=canvas.getContext('2d',{willReadFrequently:true});
+    context.drawImage(source,sx,sy,sw,sh,0,0,canvas.width,canvas.height);
+    let imageData=context.getImageData(0,0,canvas.width,canvas.height);
+    if(highContrast) imageData=enhanceContrast(imageData);
+    const results=await decodeBarcodes(imageData,{...READER_OPTS,tryDownscale:false});
+    return pickMachineBarcode(results);
+  }finally{canvas.width=0;canvas.height=0;}
 }
 
-async function scanDetailedAreas(file,session){
+async function scanDetailedAreas(file,session,isActive=()=>fileScanSession===session){
   const source=await loadScanImage(file);
   const crops=[
     {x:0,y:.45,width:1,height:.55},
@@ -556,12 +558,12 @@ async function scanDetailedAreas(file,session){
   ];
   try{
     for(const crop of crops){
-      if(fileScanSession!==session)return null;
+      if(!isActive())return null;
       const normal=await scanCrop(source,crop,false);
-      if(fileScanSession!==session)return null;
+      if(!isActive())return null;
       if(normal) return normal;
       const enhanced=await scanCrop(source,crop,true);
-      if(fileScanSession!==session)return null;
+      if(!isActive())return null;
       if(enhanced) return enhanced;
     }
   }finally{
@@ -621,6 +623,111 @@ async function configureCamera(session,track){
     await applyCameraSetting(session,{focusMode:'single-shot'});
   }
 }
+
+// 動画では細部を読めない場合だけ、同じカメラの静止画経路を補助に使う。
+// 撮影条件は端末の対応範囲内、フラッシュなし。非対応なら通常の動画読取を続ける。
+async function prepareCameraPhoto(session){
+  if(cameraSession!==session || typeof ImageCapture!=='function') return;
+  try{
+    const capture=new ImageCapture(session.track);
+    if(typeof capture.getPhotoCapabilities!=='function' || typeof capture.takePhoto!=='function') return;
+    const caps=await capture.getPhotoCapabilities();
+    if(cameraSession!==session || !Array.isArray(caps.fillLightMode) || !caps.fillLightMode.includes('off')) return;
+    const ranges=[caps.imageWidth,caps.imageHeight];
+    if(ranges.some(range=>!range || !Number.isFinite(range.min) || !Number.isFinite(range.max) || range.min<=0 || range.max<range.min)) return;
+    const scale=Math.min(1,2560/Math.max(caps.imageWidth.max,caps.imageHeight.max));
+    const imageWidth=Math.floor(caps.imageWidth.max*scale),imageHeight=Math.floor(caps.imageHeight.max*scale);
+    if(imageWidth<caps.imageWidth.min || imageHeight<caps.imageHeight.min) return;
+    session.photo={capture,settings:{fillLightMode:'off',imageWidth,imageHeight},attempts:0,busy:false,disabled:false,
+      capturePending:false,timeout:null,nextAt:0,frameAfter:0,candidate:'',candidateAt:0,candidateAttempt:0};
+  }catch{} // 任意の静止画APIが失敗しても動画スキャンは止めない。
+}
+
+async function cameraPhotoSize(blob){
+  // 要求サイズより大きいJPEGが返る端末もある。画像を展開する前に圧縮ヘッダーを確認する。
+  if(!blob || !Number.isFinite(blob.size) || blob.size<=0 || blob.size>12*1024*1024 || typeof blob.slice!=='function') return null;
+  const bytes=new Uint8Array(await blob.slice(0,256*1024).arrayBuffer());
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  let width=0,height=0;
+  if(bytes.length>=24 && bytes[0]===137 && bytes[1]===80 && bytes[2]===78 && bytes[3]===71 &&
+     bytes[4]===13 && bytes[5]===10 && bytes[6]===26 && bytes[7]===10 &&
+     bytes[12]===73 && bytes[13]===72 && bytes[14]===68 && bytes[15]===82){
+    width=view.getUint32(16);height=view.getUint32(20);
+  }else if(bytes[0]===255 && bytes[1]===216){
+    let offset=2;
+    while(offset+4<=bytes.length){
+      if(bytes[offset++]!==255) return null;
+      while(bytes[offset]===255) offset++;
+      const marker=bytes[offset++];
+      if(marker===217 || marker===218 || offset+2>bytes.length) break;
+      if(marker===1 || (marker>=208 && marker<=215)) continue;
+      const length=view.getUint16(offset);
+      if(length<2 || offset+length>bytes.length) return null;
+      if(marker>=192 && marker<=207 && ![196,200,204].includes(marker)){
+        if(length<8) return null;
+        height=view.getUint16(offset+3);width=view.getUint16(offset+5);break;
+      }
+      offset+=length;
+    }
+  }
+  return width>0 && height>0 && width<=8192 && height<=8192 && width*height<=8000000?{width,height}:null;
+}
+
+function armCameraMuteTimer(session){
+  if(cameraSession!==session || !session.trackMuted || session.muteTimer) return;
+  // 撮影中の一時停止だけ猶予する。撮影完了または5秒の期限後は通常の3秒判定に戻す。
+  if(session.photo?.capturePending && !session.photo.disabled) return;
+  session.muteTimer=setTimeout(()=>{
+    session.muteTimer=null;
+    if(cameraSession===session && session.trackMuted) failScanner(session,'カメラが一時停止しました。スキャンボタンから再開してください。');
+  },3000);
+}
+
+function maybeCaptureCameraPhoto(session){
+  const photo=session.photo;
+  if(cameraSession!==session || !photo || photo.disabled || photo.busy || photo.attempts>=3 ||
+     session.misses<4 || Date.now()-session.startedAt<2000 || Date.now()<photo.nextAt ||
+     session.frames<=photo.frameAfter || session.trackMuted || session.track?.muted || session.track?.readyState!=='live') return;
+  captureCameraPhoto(session,photo);
+}
+
+async function captureCameraPhoto(session,photo){
+  photo.busy=true;photo.capturePending=true;
+  const attempt=++photo.attempts;
+  const active=()=>cameraSession===session && !photo.disabled;
+  photo.timeout=setTimeout(()=>{
+    photo.timeout=null;photo.disabled=true;photo.capturePending=false;
+    // takePhoto は中断できない。応答が遅れても再撮影を重ねず、この起動中の補助を終了する。
+    armCameraMuteTimer(session);
+  },5000);
+  try{
+    const blob=await photo.capture.takePhoto(photo.settings);
+    clearTimeout(photo.timeout);photo.timeout=null;photo.capturePending=false;
+    armCameraMuteTimer(session);
+    if(!active()) return;
+    const size=await cameraPhotoSize(blob);
+    if(!active()) return;
+    if(!size){photo.disabled=true;return;}
+    let result=pickMachineBarcode(await decodeBarcodes(blob,READER_OPTS));
+    if(!active()) return;
+    if(!result) result=await scanDetailedAreas(blob,session,active);
+    if(!active()) return;
+    const now=Date.now();
+    if(result){
+      // 同じ写真の加工違いは1回と数える。別々の撮影で同じ番号を確認してから登録する。
+      if(photo.candidate===result.text && photo.candidateAttempt!==attempt && now-photo.candidateAt<10000){
+        stopScanner(false);addScan(result.text,result.format);return;
+      }
+      photo.candidate=result.text;photo.candidateAt=now;photo.candidateAttempt=attempt;
+    }else if(now-photo.candidateAt>=10000){photo.candidate='';}
+  }catch{photo.disabled=true;}
+  finally{
+    clearTimeout(photo.timeout);photo.timeout=null;photo.capturePending=false;photo.busy=false;
+    photo.nextAt=Date.now()+1500;photo.frameAfter=session.frames;
+    armCameraMuteTimer(session);
+  }
+}
+
 function cameraFrameArea(width,height,fullFrame=false){
   if(fullFrame){
     return {sx:0,sy:0,sw:width,sh:height,
@@ -650,6 +757,7 @@ function stopScanner(restoreFocus=true){
     clearTimeout(session.timer);
     clearTimeout(session.startupTimer);
     clearTimeout(session.muteTimer);
+    if(session.photo){session.photo.disabled=true;clearTimeout(session.photo.timeout);}
     if(session.frameCallback!=null && cameraVideo.cancelVideoFrameCallback) cameraVideo.cancelVideoFrameCallback(session.frameCallback);
     if(session.stream) session.stream.getTracks().forEach(track=>track.stop());
     session.canvas.width=0; session.canvas.height=0;
@@ -696,6 +804,7 @@ async function scanCameraFrame(session){
       const result=pickMachineBarcode(await decodeBarcodes(frame,{...READER_OPTS,tryDownscale:false}));
       if(cameraSession!==session) return;
       session.errors=0;
+      session.misses=result?0:session.misses+1;
       const now=Date.now();
       if(result){
         // 別の映像フレームで確認。低速端末の解析時間にも余裕を持たせる。
@@ -719,7 +828,10 @@ async function scanCameraFrame(session){
       return;
     }
   }
-  if(cameraSession===session) session.timer=setTimeout(()=>scanCameraFrame(session),220);
+  if(cameraSession===session){
+    maybeCaptureCameraPhoto(session);
+    session.timer=setTimeout(()=>scanCameraFrame(session),220);
+  }
 }
 async function startScanner(){
   if(cameraSession || fileScanBusy || !readBarcodes) return;
@@ -727,7 +839,7 @@ async function startScanner(){
     showScanNotice('この環境では連続スキャンを使えません。SafariまたはChromeでHTTPSの公開URLを開くか、「アルバムから選ぶ」をお使いください。',true);
     return;
   }
-  const session={stream:null,track:null,timer:null,startupTimer:null,muteTimer:null,canvas:document.createElement('canvas'),frames:0,errors:0,candidate:'',candidateAt:0};
+  const session={stream:null,track:null,timer:null,startupTimer:null,muteTimer:null,trackMuted:false,startedAt:Date.now(),misses:0,canvas:document.createElement('canvas'),frames:0,errors:0,candidate:'',candidateAt:0};
   cameraSession=session;
   el('scanNotice').hidden=true;
   scannerMessage.textContent='カメラを起動しています…';
@@ -754,10 +866,10 @@ async function startScanner(){
       track.addEventListener('ended',()=>failScanner(session,'カメラが停止しました。「スキャン」で再開してください。'));
       track.addEventListener('mute',()=>{
         if(cameraSession!==session) return;
-        clearTimeout(session.muteTimer);
-        session.muteTimer=setTimeout(()=>failScanner(session,'カメラが一時停止しました。スキャンボタンから再開してください。'),3000);
+        session.trackMuted=true;
+        armCameraMuteTimer(session);
       });
-      track.addEventListener('unmute',()=>{clearTimeout(session.muteTimer);});
+      track.addEventListener('unmute',()=>{session.trackMuted=false;clearTimeout(session.muteTimer);session.muteTimer=null;});
     });
     cameraVideo.srcObject=stream;
     session.startupTimer=setTimeout(()=>failScanner(session,'カメラ映像を表示できませんでした。もう一度スキャンするか、写真から読み取ってください。'),15000);
@@ -774,7 +886,7 @@ async function startScanner(){
     }
     scannerMessage.textContent='バーコードにかざしてください';
     // ピント調整の応答が遅くても、映像の読み取りは開始する。
-    configureCamera(session,session.track);
+    configureCamera(session,session.track).then(()=>prepareCameraPhoto(session)).catch(()=>{});
     scanCameraFrame(session);
   }catch(error){
     if(cameraSession===session) failScanner(session,cameraErrorMessage(error));
