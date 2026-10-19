@@ -594,12 +594,31 @@ async function applyCameraSetting(session,setting){
 async function configureCamera(session,track){
   let caps={};
   try{caps=track?.getCapabilities?.()||{};}catch{}
+  if(cameraSession!==session) return;
+  const focusModes=Array.isArray(caps.focusMode)?caps.focusMode:[];
+  let continuousFocus=false;
+  if(focusModes.includes('continuous')){
+    continuousFocus=await applyCameraSetting(session,{focusMode:'continuous'});
+  }
+  if(cameraSession!==session) return;
   // focus と exposure を分け、一方の非対応で他方も失敗することを防ぐ。
-  for(const name of ['focusMode','exposureMode']){
-    if(cameraSession!==session) return;
-    if(Array.isArray(caps[name]) && caps[name].includes('continuous')){
-      await applyCameraSetting(session,{[name]:'continuous'});
+  if(Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')){
+    await applyCameraSetting(session,{exposureMode:'continuous'});
+  }
+  if(cameraSession!==session) return;
+  if(continuousFocus || focusModes.includes('single-shot')){
+    let supportsCenter=false;
+    try{supportsCenter=navigator.mediaDevices.getSupportedConstraints?.().pointsOfInterest===true;}catch{}
+    // 読み取り枠は映像の中央。ブラウザが認識する場合だけ中央を自動調整の対象にする。
+    if(supportsCenter){
+      await applyCameraSetting(session,{pointsOfInterest:[{x:0.5,y:0.5}]});
     }
+  }
+  if(cameraSession!==session) return;
+  // 連続AFが使えない場合だけ単発AFを要求する。後続の設定で再発火させないよう最後に行う。
+  // getSettings の反映が遅い端末もあるため、読み戻しだけで連続AFを置き換えない。
+  if(!continuousFocus && focusModes.includes('single-shot')){
+    await applyCameraSetting(session,{focusMode:'single-shot'});
   }
 }
 function cameraFrameArea(width,height,fullFrame=false){

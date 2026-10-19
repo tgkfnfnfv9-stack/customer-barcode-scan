@@ -75,6 +75,8 @@ async function fixture(t,options={}){
       {kind:'videoinput',deviceId:'rear-tele',label:'Back Telephoto Camera'},
       {kind:'videoinput',deviceId:'front',label:'Front Camera'},
     ];
+    const supportedConstraints=navigator.mediaDevices.getSupportedConstraints();
+    navigator.mediaDevices.getSupportedConstraints=()=>({...supportedConstraints,pointsOfInterest:options.pointsOfInterest===true});
     navigator.mediaDevices.getUserMedia=async constraints=>{
       state.requests.push(constraints);
       const canvas=document.createElement('canvas');
@@ -86,12 +88,13 @@ async function fixture(t,options={}){
       Object.defineProperty(track,'label',{value:deviceId==='rear-main'?'Back Camera':'Back Telephoto Camera'});
       track.getSettings=()=>({...settings});
       track.getCapabilities=()=>options.unsupported?{}:{
-        focusMode:['manual','single-shot','continuous'],exposureMode:['continuous'],whiteBalanceMode:['continuous'],
+        focusMode:options.focusModes||['manual','single-shot','continuous'],exposureMode:['continuous'],whiteBalanceMode:['continuous'],
         zoom:{min:1,max:4,step:.1},torch:true,
       };
       track.applyConstraints=async value=>{
         state.constraints.push({deviceId,value});
         if(options.rejectConstraints)throw new DOMException('Optional control unsupported','OverconstrainedError');
+        if(options.rejectContinuous&&value.advanced?.some(setting=>setting.focusMode==='continuous'))throw new DOMException('Continuous focus unsupported','OverconstrainedError');
         Object.assign(settings,value,...value.advanced||[]);
       };
       const entry={stream,track,canvas,frame:0,timer:null};state.streams.push(entry);
@@ -248,6 +251,43 @@ test('missing or rejected optional focus settings cannot prevent scanning',async
   assert.equal(await page.evaluate(()=>window.__cameraTest.constraints.length),0);
   await page.locator('#closeScanner').click();
   const rejecting=await fixture(t,{rejectConstraints:true});await start(rejecting);await waitForRegistration(rejecting);
+});
+
+test('supported center focus preserves continuous autofocus while real WASM reads without reopening the camera',async t=>{
+  const page=await fixture(t,{pointsOfInterest:true});await start(page);await waitForRegistration(page);
+  const state=await page.evaluate(()=>({
+    requests:window.__cameraTest.requests.length,
+    streams:window.__cameraTest.streams.length,
+    settings:window.__cameraTest.streams[0].track.getSettings(),
+    constraints:window.__cameraTest.constraints.map(entry=>entry.value),
+  }));
+  assert.equal(state.requests,1);assert.equal(state.streams,1);
+  assert.equal(state.settings.focusMode,'continuous');
+  assert.deepEqual(state.settings.pointsOfInterest,[{x:.5,y:.5}]);
+  assert.ok(state.constraints.some(value=>value.advanced?.some(setting=>setting.pointsOfInterest)),'supported center point is requested');
+  assert.equal(state.constraints.some(value=>value.advanced?.some(setting=>setting.focusMode==='single-shot')),false,'successful continuous autofocus does not trigger single-shot');
+});
+
+test('single-shot fallback runs once after center and exposure setup while real WASM continues reading',async t=>{
+  for(const options of [
+    {focusModes:['manual','single-shot']},
+    {focusModes:['manual','single-shot','continuous'],rejectContinuous:true},
+  ]){
+    const page=await fixture(t,{...options,pointsOfInterest:true});await start(page);await waitForRegistration(page);
+    const state=await page.evaluate(()=>({
+      requests:window.__cameraTest.requests.length,
+      streams:window.__cameraTest.streams.length,
+      settings:window.__cameraTest.streams[0].track.getSettings(),
+      constraints:window.__cameraTest.constraints.map(entry=>entry.value),
+    }));
+    assert.equal(state.requests,1);assert.equal(state.streams,1);
+    const singleShots=state.constraints.filter(value=>value.advanced?.some(setting=>setting.focusMode==='single-shot'));
+    assert.equal(singleShots.length,1,'later optional settings cannot retrigger single-shot focus');
+    assert.equal(state.constraints.at(-1),singleShots[0],'single-shot is the final camera adjustment');
+    assert.equal(state.settings.focusMode,'single-shot');
+    assert.equal(state.settings.exposureMode,'continuous');
+    assert.deepEqual(state.settings.pointsOfInterest,[{x:.5,y:.5}]);
+  }
 });
 
 test('a real decode completed after close cannot register or revive the camera',async t=>{
