@@ -7,22 +7,30 @@ const path=require('node:path');
 const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 const moduleSource=html.match(/<script type="module">([\s\S]*?)<\/script>/)[1];
 const source=moduleSource.slice(0,moduleSource.lastIndexOf('\nrender();\ninitialize();'));
-const flush=async()=>{for(let i=0;i<12;i++) await Promise.resolve();};
-function deferred(){let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve};}
-function stream(){
-  const listeners={};
-  const track={stopped:false,stop(){this.stopped=true;},addEventListener(name,fn){listeners[name]=fn;}};
-  return {track,listeners,getTracks:()=>[track],getVideoTracks:()=>[track]};
+const flush=async()=>{for(let i=0;i<40;i++) await Promise.resolve();};
+function deferred(){let resolve,reject; const promise=new Promise((r,j)=>{resolve=r;reject=j;}); return {promise,resolve,reject};}
+function stream({capabilities={},settings={deviceId:'rear-main',facingMode:'environment'}}={}){
+  const listeners={},constraints=[];
+  const track={
+    stopped:false,readyState:'live',stop(){this.stopped=true;this.readyState='ended';},
+    addEventListener(name,fn){listeners[name]=fn;},
+    getCapabilities:()=>capabilities,getSettings:()=>settings,
+    async applyConstraints(value){constraints.push(value);Object.assign(settings,...(value.advanced||[]));}
+  };
+  return {track,listeners,constraints,getTracks:()=>[track],getVideoTracks:()=>[track]};
 }
 function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   const timers=new Map(), elements=new Map(), events={}, storage=new Map(), requests=[];
   let timerId=0, context;
+  const canvasDraws=[],frameReads=[];
+  let now=Date.now();
+  class TestDate extends Date{static now(){return now;}}
   const openedUrls=[], copied=[];
   if(storedHistory) storage.set('kkmt_customer_barcode_history',JSON.stringify(storedHistory));
   class Element{
     constructor(){
       this.style={}; this.children=[]; this.childNodes=this.children; this.handlers={}; this.hidden=false; this.open=false;
-      this.textContent=''; this.value=''; this.readyState=4; this.videoWidth=1280; this.videoHeight=720;
+      this.textContent=''; this.value=''; this.readyState=4; this.videoWidth=1280; this.videoHeight=720; this.currentTime=0;
       this.classList={add(){},remove(){},toggle(){}};
     }
     get textContent(){return this._textContent;}
@@ -37,17 +45,24 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
     select(){} setSelectionRange(){} click(){this.handlers.click?.();}
     showModal(){this.open=true;} close(){this.open=false;}
     pause(){} play(){return Promise.resolve();}
-    getContext(){return {drawImage(){},getImageData:()=>({data:new Uint8ClampedArray(16),width:2,height:2})};}
+    getContext(){return {
+      drawImage:(...args)=>canvasDraws.push({canvas:this,args}),
+      getImageData:(x,y,width,height)=>{
+        frameReads.push({width,height});
+        return {data:new Uint8ClampedArray([90,120,150,255,90,120,150,255]),width,height};
+      }
+    };}
   }
   const declaredIds=new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m=>m[1]));
   const get=id=>{assert.ok(declaredIds.has(id),'Existing DOM id: '+id);if(!elements.has(id)) elements.set(id,new Element()); return elements.get(id);};
   get('scanNotice').hidden=true;
   const camera=stream();
   const sandbox={
-    console,URL,Date,Uint8Array,Uint8ClampedArray,TextDecoder,Blob,AbortController,
+    console,URL,Date:TestDate,Uint8Array,Uint8ClampedArray,TextDecoder,Blob,AbortController,
+    testAdvance:ms=>{now+=ms;},
     document:{getElementById:get,createElement:()=>new Element(),body:new Element(),hidden:false,addEventListener:(n,f)=>events[n]=f},
-    window:{addEventListener:(n,f)=>events[n]=f,open(url){openedUrls.push(url);return {};},scrollY:0,scrollBy:(x,y)=>{sandbox.window.scrollY+=y;}},
-    navigator:{clipboard:{writeText:async text=>{copied.push(text);}},mediaDevices:{getUserMedia:getUserMedia||(()=>Promise.resolve(camera))}},
+    window:{innerWidth:390,innerHeight:844,addEventListener:(n,f)=>events[n]=f,open(url){openedUrls.push(url);return {};},scrollY:0,scrollBy:(x,y)=>{sandbox.window.scrollY+=y;}},
+    navigator:{clipboard:{writeText:async text=>{copied.push(text);}},mediaDevices:{enumerateDevices:async()=>[],getUserMedia:getUserMedia||(()=>Promise.resolve(camera))}},
     localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
     location:{href:'https://example.test/',origin:'https://example.test/',pathname:'/'},
     setTimeout:(fn,ms)=>{const id=++timerId; timers.set(id,{fn,ms}); return id;},clearTimeout:id=>timers.delete(id),
@@ -65,10 +80,11 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   vm.runInContext(source+`\nreadBarcodes=testDecode; updateScanButton(); render();
     this.api={startScanner,stopScanner,scanCameraFrame,handleFile,addScan,render,submitManual,copyText,formatPrice,publicStock,initialize,refreshHistory,
       setHistory:items=>{history=items;render();},setInit:fn=>{initLib=fn;},
-      session:()=>cameraSession,history:()=>history,loadStock,
+      session:()=>cameraSession,history:()=>history,loadStock,advance:ms=>{testAdvance(ms);},
       setDecoder:fn=>{readBarcodes=fn;},setMedia:fn=>{navigator.mediaDevices.getUserMedia=fn;}};`,context);
   return {api:context.api,get,camera,events,storage,requests,sandbox,openedUrls,copied,
-    tick:async()=>{const next=[...timers].find(([,v])=>v.ms===220); assert.ok(next,'next scan scheduled'); timers.delete(next[0]); await next[1].fn(); await flush();},
+    canvasDraws,frameReads,
+    tick:async({advance=true}={})=>{if(advance)get('cameraVideo').currentTime+=.22;const next=[...timers].find(([,v])=>v.ms===220); assert.ok(next,'next scan scheduled'); timers.delete(next[0]); await next[1].fn(); await flush();},
     timers};
 }
 const code=value=>[{text:value,format:'Code128'}];
@@ -149,7 +165,14 @@ test('backgrounding, page exit, Escape, manual entry and interrupted track relea
     else if(trigger==='pagehide') a.events.pagehide();
     else if(trigger==='cancel') a.get('scanner').handlers.cancel({preventDefault(){}});
     else if(trigger==='manual') a.get('scannerManual').handlers.click();
-    else a.camera.listeners[trigger]();
+    else {
+      a.camera.listeners[trigger]();
+      if(trigger==='mute'){
+        assert.equal(a.camera.track.stopped,false,'temporary mute keeps the stream');
+        const timer=[...a.timers.values()].find(value=>value.ms===3000);
+        assert.ok(timer,'persistent mute timeout');timer.fn();
+      }
+    }
     assert.equal(a.camera.track.stopped,true,trigger);
     assert.equal(a.get('scanner').open,false,trigger);
     assert.equal(a.api.history().length,0,trigger);
@@ -381,4 +404,398 @@ test('cancelled photo work leaves a ready status when returning to the page',asy
   assert.equal(a.get('status').textContent,'写真解析を中止しました');
   assert.equal(a.get('led').className,'led ready');
   assert.equal(a.api.history().length,0);
+});
+
+// Camera acquisition and frame-processing regressions shared by customer and staff scanners.
+test('camera requests high-resolution rear video with orientation-aware dimensions',async()=>{
+  for(const portrait of [true,false]){
+    const requests=[];
+    const a=app({getUserMedia:async constraints=>{requests.push(constraints);return a.camera;}});
+    a.sandbox.window.innerWidth=portrait?390:844;
+    a.sandbox.window.innerHeight=portrait?844:390;
+    await a.api.startScanner();await flush();
+    const request=requests[0];
+    assert.equal(request.audio,false);
+    assert.equal(request.video.facingMode.ideal,'environment');
+    assert.equal(request.video.width.ideal,portrait?1440:2560);
+    assert.equal(request.video.height.ideal,portrait?2560:1440);
+    assert.equal(request.video.frameRate.ideal,30);
+    a.api.stopScanner();
+  }
+});
+
+test('unsupported acquisition constraints retry once with basic rear-camera settings',async()=>{
+  const requests=[];
+  const a=app({getUserMedia:async constraints=>{
+    requests.push(constraints);
+    if(requests.length===1)throw Object.assign(new Error('unsupported resolution'),{name:'OverconstrainedError'});
+    return a.camera;
+  }});
+  await a.api.startScanner();await flush();
+  assert.equal(requests.length,2);
+  assert.equal(requests[1].audio,false);
+  assert.equal(requests[1].video.facingMode.ideal,'environment');
+  for(const key of ['width','height','frameRate'])assert.equal(requests[1].video[key],undefined,key);
+  assert.equal(a.get('scanner').open,true);
+  assert.ok(a.frameReads.length>0,'basic camera fallback still scans');
+  a.api.stopScanner();
+});
+
+test('permission and camera-busy errors do not repeat the camera request',async()=>{
+  for(const name of ['NotAllowedError','SecurityError','NotReadableError']){
+    let requests=0;
+    const a=app({getUserMedia:async()=>{requests++;throw Object.assign(new Error(name),{name});}});
+    await a.api.startScanner();await flush();
+    assert.equal(requests,1,name);
+    assert.equal(a.api.session(),null,name);
+    assert.equal(a.get('scanner').open,false,name);
+  }
+});
+
+test('closing during acquisition failure suppresses an obsolete fallback request',async()=>{
+  const pending=deferred();let requests=0;
+  const a=app({getUserMedia:()=>{requests++;return pending.promise;}});
+  const opening=a.api.startScanner();
+  a.api.stopScanner();
+  pending.reject(Object.assign(new Error('unsupported resolution'),{name:'OverconstrainedError'}));
+  await opening;await flush();
+  assert.equal(requests,1);
+  assert.equal(a.api.session(),null);
+  assert.equal(a.get('scanner').open,false);
+});
+
+test('continuous focus and exposure are independent optional improvements',async()=>{
+  const a=app(),calls=[];
+  a.camera.track.getCapabilities=()=>({focusMode:['manual','continuous'],exposureMode:['continuous']});
+  a.camera.track.applyConstraints=async value=>{
+    calls.push(value);
+    if(value.advanced?.some(option=>option.focusMode))throw new Error('focus unsupported by driver');
+  };
+  await a.api.startScanner();await flush();
+  assert.ok(calls.some(value=>value.advanced?.some(option=>option.focusMode==='continuous')));
+  assert.ok(calls.some(value=>value.advanced?.some(option=>option.exposureMode==='continuous')));
+  assert.ok(calls.every(value=>!value.advanced?.some(option=>option.focusMode&&option.exposureMode)),'one failure cannot discard both modes');
+  assert.equal(a.get('scanner').open,true);
+  assert.ok(a.frameReads.length>0);
+  a.api.stopScanner();
+});
+
+test('capability and device-enumeration failures leave basic scanning usable',async()=>{
+  for(const failing of ['capabilities','settings','enumeration','missing methods']){
+    const a=app({decode:async()=>code('P009000')});
+    if(failing==='capabilities')a.camera.track.getCapabilities=()=>{throw new Error('driver capabilities unavailable');};
+    if(failing==='settings')a.camera.track.getSettings=()=>{throw new Error('driver settings unavailable');};
+    if(failing==='enumeration')a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>{throw new Error('enumeration unavailable');};
+    if(failing==='missing methods'){
+      delete a.camera.track.getCapabilities;delete a.camera.track.getSettings;delete a.camera.track.applyConstraints;
+    }
+    await a.api.startScanner();await flush();
+    assert.equal(a.get('scanner').open,true,failing);
+    await a.tick();
+    assert.equal(a.api.history()[0]?.code,'P009000',failing);
+  }
+});
+
+test('ending the track during pending focus setup cannot restart its scanner',async()=>{
+  const pending=deferred(),a=app();
+  a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous']});
+  a.camera.track.applyConstraints=()=>pending.promise;
+  const opening=a.api.startScanner();await flush();
+  assert.equal(a.get('scanner').open,true);
+  assert.ok(a.frameReads.length>0,'optional focus setup cannot block basic decoding');
+  a.camera.listeners.ended();
+  const frameCount=a.frameReads.length;
+  pending.resolve();await opening;await flush();
+  assert.equal(a.camera.track.stopped,true);
+  assert.equal(a.api.session(),null);
+  assert.equal(a.get('scanner').open,false);
+  assert.equal(a.frameReads.length,frameCount);
+  assert.equal(a.timers.size,0);
+});
+
+test('brief track mute recovers without stopping and clears its obsolete timeout',async()=>{
+  const a=app();await a.api.startScanner();await flush();
+  a.camera.listeners.mute();
+  const muteTimer=[...a.timers].find(([,timer])=>timer.ms===3000);
+  assert.ok(muteTimer);
+  assert.equal(a.camera.track.stopped,false);
+  a.camera.listeners.unmute();
+  assert.equal(a.timers.has(muteTimer[0]),false);
+  assert.equal(a.get('scanner').open,true);
+  await a.tick();
+  assert.equal(a.camera.track.stopped,false);
+  a.api.stopScanner();
+});
+
+test('a frozen video frame cannot confirm the same barcode twice',async()=>{
+  let decoded=0;
+  const a=app({decode:async()=>{decoded++;return code('P009000');}});
+  await a.api.startScanner();await flush();
+  for(let i=0;i<3;i++)await a.tick({advance:false});
+  assert.equal(decoded,1);
+  assert.equal(a.api.history().length,0);
+  assert.equal(a.get('scanner').open,true);
+  await a.tick();
+  assert.equal(decoded,2);
+  assert.equal(a.api.history()[0]?.code,'P009000');
+});
+
+test('slow phones can confirm a matching new frame after three seconds',async()=>{
+  const a=app({decode:async()=>code('P009000')});
+  await a.api.startScanner();await flush();
+  a.api.advance(3200);await a.tick();
+  assert.equal(a.api.history()[0]?.code,'P009000');
+});
+
+test('expired candidates still require a second fresh matching frame',async()=>{
+  const a=app({decode:async()=>code('P009000')});
+  await a.api.startScanner();await flush();
+  a.api.advance(6000);await a.tick();
+  assert.equal(a.api.history().length,0);
+  await a.tick();assert.equal(a.api.history()[0]?.code,'P009000');
+});
+
+test('central and full camera frames each receive original and contrast passes within the pixel budget',async()=>{
+  const decoded=[];
+  const a=app({decode:async frame=>{decoded.push({width:frame.width,height:frame.height,pixel:[...frame.data.slice(0,3)]});return [];}});
+  a.get('cameraVideo').videoWidth=3840;a.get('cameraVideo').videoHeight=2160;
+  await a.api.startScanner();await flush();
+  for(let i=0;i<3;i++)await a.tick();
+  assert.equal(decoded.length,4);
+  assert.deepEqual(a.canvasDraws.map(draw=>draw.args[2]),[432,432,0,0]);
+  assert.deepEqual(a.canvasDraws.map(draw=>draw.args[4]),[1296,1296,2160,2160]);
+  assert.deepEqual(decoded[0].pixel,[90,120,150]);
+  assert.notDeepEqual(decoded[1].pixel,decoded[0].pixel);
+  assert.deepEqual(decoded[2].pixel,decoded[0].pixel,'full frame retains an unmodified decode attempt');
+  assert.deepEqual(decoded[3].pixel,decoded[1].pixel);
+  assert.ok(decoded.some(frame=>frame.width>1920),'high-resolution narrow bars are retained');
+  for(const frame of decoded){
+    assert.ok(Math.max(frame.width,frame.height)<=2560);
+    assert.ok(frame.width*frame.height<=2100000,'large camera frames respect the memory and CPU budget');
+  }
+  a.api.stopScanner();
+});
+
+test('supported camera controls apply bounded zoom and toggle the torch',async()=>{
+  const a=app();
+  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:8,step:.5},torch:true});
+  await a.api.startScanner();await flush();
+  assert.equal(a.get('cameraControls').hidden,false);
+  assert.equal(a.get('cameraZoomControl').hidden,false);
+  assert.equal(a.get('cameraTorch').hidden,false);
+  assert.equal(a.get('switchCamera').hidden,true);
+  assert.equal(a.get('cameraZoom').max,'3');
+  a.get('cameraZoom').value='2.4';a.get('cameraZoom').handlers.input();
+  assert.equal(a.get('cameraZoomLabel').textContent,'2.4×');
+  await a.get('cameraZoom').handlers.change();
+  assert.equal(a.camera.track.getSettings().zoom,2.5);
+  assert.equal(a.get('cameraZoomLabel').textContent,'2.5×');
+  a.get('cameraZoom').value='9';await a.get('cameraZoom').handlers.change();
+  assert.equal(a.camera.track.getSettings().zoom,3);
+  await a.get('cameraTorch').handlers.click();
+  assert.equal(a.camera.track.getSettings().torch,true);
+  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'true');
+  await a.get('cameraTorch').handlers.click();
+  assert.equal(a.camera.track.getSettings().torch,false);
+  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false');
+  a.api.stopScanner();
+  assert.equal(a.get('cameraControls').hidden,true);
+});
+
+test('unsupported camera controls remain hidden',async()=>{
+  const a=app();await a.api.startScanner();await flush();
+  for(const id of ['cameraControls','cameraZoomControl','cameraTorch','switchCamera'])assert.equal(a.get(id).hidden,true,id);
+  a.api.stopScanner();
+});
+
+test('failed zoom and torch requests restore controls and keep scanning',async()=>{
+  const a=app();
+  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:3,step:.1},torch:true});
+  a.camera.track.applyConstraints=async()=>{throw new Error('camera driver rejected setting');};
+  await a.api.startScanner();await flush();
+  a.get('cameraZoom').value='2';await a.get('cameraZoom').handlers.change();
+  assert.equal(a.get('cameraZoom').value,'1');
+  assert.equal(a.get('cameraZoomLabel').textContent,'1.0×');
+  await a.get('cameraTorch').handlers.click();
+  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false');
+  for(const id of ['cameraZoom','cameraTorch','switchCamera'])assert.equal(a.get(id).disabled,false,id);
+  assert.equal(a.get('scanner').open,true);
+  const frames=a.frameReads.length;await a.tick();assert.equal(a.frameReads.length,frames+1);
+  a.api.stopScanner();
+});
+
+test('late zoom or torch completion cannot overwrite controls belonging to a newer camera',async()=>{
+  for(const kind of ['zoom','torch']){
+    const pending=deferred(),a=app();
+    const capabilities={zoom:{min:1,max:3,step:.25},torch:true};
+    a.camera.track.getCapabilities=()=>capabilities;
+    a.camera.track.applyConstraints=()=>pending.promise;
+    await a.api.startScanner();await flush();
+    a.get('cameraZoom').value='2';
+    const changing=kind==='zoom'?a.get('cameraZoom').handlers.change():a.get('cameraTorch').handlers.click();
+    assert.equal(a.get('cameraZoom').disabled,true);
+    a.api.stopScanner();
+    const next=stream({capabilities,settings:{deviceId:'rear-next',zoom:1.25,torch:false}});
+    a.api.setMedia(async()=>next);await a.api.startScanner();await flush();
+    const label=a.get('cameraZoomLabel').textContent;
+    pending.resolve();await changing;await flush();
+    assert.equal(a.get('cameraZoomLabel').textContent,label,kind);
+    assert.equal(a.get('cameraZoom').value,'1.25',kind);
+    assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false',kind);
+    assert.equal(a.get('cameraZoom').disabled,false,kind);
+    assert.equal(next.track.stopped,false,kind);
+    a.api.stopScanner();
+  }
+});
+
+test('late camera configuration and enumeration cannot reveal obsolete controls',async()=>{
+  for(const pendingStage of ['focus','enumeration']){
+    const pending=deferred(),a=app();
+    if(pendingStage==='focus'){
+      a.camera.track.getCapabilities=()=>({focusMode:['continuous'],zoom:{min:1,max:3},torch:true});
+      a.camera.track.applyConstraints=()=>pending.promise;
+    }else a.sandbox.navigator.mediaDevices.enumerateDevices=()=>pending.promise;
+    await a.api.startScanner();await flush();a.api.stopScanner();
+    const next=stream();a.api.setMedia(async()=>next);
+    a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[];
+    await a.api.startScanner();await flush();
+    pending.resolve([{kind:'videoinput',deviceId:'rear-old'},{kind:'videoinput',deviceId:'front-old'}]);
+    await flush();
+    for(const id of ['cameraControls','cameraZoomControl','cameraTorch','switchCamera'])assert.equal(a.get(id).hidden,true,pendingStage+' '+id);
+    assert.equal(next.track.stopped,false);
+    a.api.stopScanner();
+  }
+});
+
+test('camera switching releases the old track and requests the next exact video device',async()=>{
+  const requests=[],opened=[];
+  const a=app({getUserMedia:async constraints=>{
+    requests.push(constraints);
+    const camera=stream({settings:{deviceId:constraints.video.deviceId?.exact||'rear-main'}});
+    opened.push(camera);return camera;
+  }});
+  a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[
+    {kind:'audioinput',deviceId:'microphone'},
+    {kind:'videoinput',deviceId:'rear-main',label:'Back main'},
+    {kind:'videoinput',deviceId:'rear-wide',label:'Back wide'},
+    {kind:'videoinput',deviceId:'front',label:'Front'}
+  ];
+  await a.api.startScanner();await flush();
+  assert.equal(a.get('switchCamera').hidden,false);
+  a.get('switchCamera').handlers.click();await flush();
+  assert.equal(opened[0].track.stopped,true);
+  assert.equal(requests[1].video.deviceId.exact,'rear-wide');
+  assert.equal(requests[1].video.facingMode,undefined);
+  assert.equal(a.get('cameraVideo').srcObject,opened[1]);
+  a.get('switchCamera').handlers.click();await flush();
+  assert.equal(opened[1].track.stopped,true);
+  assert.equal(requests[2].video.deviceId.exact,'front');
+  assert.equal(a.get('scanner').open,true);
+  a.api.stopScanner();
+});
+
+test('video frame callbacks prevent duplicate-frame confirmation and are cancelled on stop',async()=>{
+  const callbacks=new Map();let id=0,decoded=0;
+  const a=app({decode:async()=>{decoded++;return code('P009000');}}),video=a.get('cameraVideo');
+  video.requestVideoFrameCallback=fn=>{callbacks.set(++id,fn);return id;};
+  video.cancelVideoFrameCallback=key=>callbacks.delete(key);
+  const present=()=>{
+    const next=[...callbacks][0];assert.ok(next);callbacks.delete(next[0]);next[1](0,{presentedFrames:id});
+  };
+  await a.api.startScanner();await flush();
+  assert.equal(decoded,0,'wait for the first presented frame');
+  present();await a.tick();assert.equal(decoded,1);
+  await a.tick();assert.equal(decoded,1,'changing video time alone does not mean a new presented frame');
+  assert.equal(a.api.history().length,0);
+  const obsolete=[...callbacks.values()][0];
+  present();await a.tick();
+  assert.equal(a.api.history()[0]?.code,'P009000');
+  assert.equal(callbacks.size,0);
+  obsolete();assert.equal(callbacks.size,0,'late callbacks cannot resubscribe after stopping');
+});
+
+test('a decode started before a zoom change cannot confirm a candidate afterward',async()=>{
+  const pending=deferred();let calls=0;
+  const a=app({decode:()=>++calls===2?pending.promise:Promise.resolve(code('P009000'))});
+  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:3,step:.1}});
+  await a.api.startScanner();await flush();
+  const decoding=a.tick();await flush();assert.equal(calls,2);
+  a.get('cameraZoom').value='2';await a.get('cameraZoom').handlers.change();
+  pending.resolve(code('P009000'));await decoding;
+  assert.equal(a.api.history().length,0,'the result from before the setting change is discarded');
+  await a.tick();assert.equal(a.api.history().length,0,'the first new image becomes a candidate');
+  await a.tick();assert.equal(a.api.history()[0]?.code,'P009000');
+});
+
+test('camera adjustments retain requested resolution and previously selected focus, exposure and light',async()=>{
+  for(const hasGetConstraints of [false,true]){
+    const a=app();
+    a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous'],zoom:{min:1,max:3,step:.5},torch:true});
+    if(hasGetConstraints)a.camera.track.getConstraints=()=>a.camera.constraints.at(-1)||{
+      facingMode:{ideal:'environment'},width:{ideal:1440},height:{ideal:2560},frameRate:{ideal:30}
+    };
+    await a.api.startScanner();await flush();
+    await a.get('cameraTorch').handlers.click();
+    a.get('cameraZoom').value='2.5';await a.get('cameraZoom').handlers.change();
+    const applied=a.camera.constraints.at(-1);
+    assert.equal(applied.width?.ideal,1440);
+    assert.equal(applied.height?.ideal,2560);
+    assert.equal(applied.frameRate?.ideal,30);
+    const values=Object.assign({},...applied.advanced);
+    assert.equal(values.focusMode,'continuous');
+    assert.equal(values.exposureMode,'continuous');
+    assert.equal(values.torch,true);
+    assert.equal(values.zoom,2.5);
+    a.get('cameraZoom').value='3';await a.get('cameraZoom').handlers.change();
+    const zooms=a.camera.constraints.at(-1).advanced.filter(value=>Object.hasOwn(value,'zoom'));
+    assert.equal(zooms.length,1,'new zoom replaces the obsolete constraint');
+    assert.equal(zooms[0].zoom,3);
+    a.api.stopScanner();
+  }
+});
+
+test('manual camera choices keep cycling when the driver omits its current device ID',async()=>{
+  const requests=[];
+  const a=app({getUserMedia:async constraints=>{
+    requests.push(constraints);return stream({settings:{}});
+  }});
+  a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[
+    {kind:'videoinput',deviceId:'rear-main'},
+    {kind:'videoinput',deviceId:'rear-wide'},
+    {kind:'videoinput',deviceId:'front'}
+  ];
+  await a.api.startScanner();await flush();
+  a.get('switchCamera').handlers.click();await flush();
+  a.get('switchCamera').handlers.click();await flush();
+  a.get('switchCamera').handlers.click();await flush();
+  const selected=requests.slice(1).map(value=>value.video.deviceId.exact);
+  assert.equal(new Set(selected).size,3,'each manual choice reaches a different camera');
+  a.api.stopScanner();
+});
+
+test('partial Chromium constraint reports cannot discard resolution or earlier camera settings',async()=>{
+  const a=app();
+  a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous'],zoom:{min:1,max:3,step:.5},torch:true});
+  a.camera.track.getConstraints=()=>{
+    const applied=a.camera.constraints.at(-1);
+    // Chromium may report only image-capture constraints after applyConstraints.
+    return applied?{advanced:applied.advanced}:{facingMode:{ideal:'environment'},width:{ideal:1440},height:{ideal:2560},frameRate:{ideal:30}};
+  };
+  await a.api.startScanner();await flush();
+  assert.equal(a.camera.constraints.length,2,'focus and exposure configured independently');
+  assert.equal(a.camera.track.getConstraints().width,undefined,'driver now omits acquisition constraints');
+  await a.get('cameraTorch').handlers.click();
+  a.get('cameraZoom').value='2.5';await a.get('cameraZoom').handlers.change();
+  assert.equal(a.camera.constraints.length,4);
+  for(const applied of a.camera.constraints){
+    assert.equal(applied.width?.ideal,1440,'each adjustment preserves capture width');
+    assert.equal(applied.height?.ideal,2560,'each adjustment preserves capture height');
+    assert.equal(applied.frameRate?.ideal,30,'each adjustment preserves capture frame rate');
+  }
+  const values=Object.assign({},...a.camera.constraints.at(-1).advanced);
+  assert.equal(values.focusMode,'continuous');
+  assert.equal(values.exposureMode,'continuous');
+  assert.equal(values.torch,true);
+  assert.equal(values.zoom,2.5);
+  a.api.stopScanner();
 });

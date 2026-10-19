@@ -66,11 +66,26 @@
   .scanner-close{border:1px solid #636970; color:#fff; background:#252A2F;}
   .camera-view{position:relative; flex:1; min-height:100px; overflow:hidden; background:#000;}
   .camera-view video{position:absolute; width:100%; height:100%; object-fit:contain;}
-  .camera-guide{position:absolute; left:6%; right:6%; top:36%; height:28%; border:3px solid #fff; border-radius:16px;
+  .camera-guide{position:absolute; left:6%; width:88%; top:35%; height:30%; box-sizing:border-box; border:3px solid #fff; border-radius:16px;
     box-shadow:0 0 0 999px rgba(0,0,0,.22); pointer-events:none;}
   .scanner-foot{flex:none; padding:16px 18px max(18px,env(safe-area-inset-bottom)); text-align:center;}
   .scanner-message{margin:0 0 7px; font-size:15px; font-weight:800; line-height:1.6;}
   .scanner-help{margin:0 0 14px; color:#CDD2D8; font-size:12px; line-height:1.6;}
+  .camera-controls{display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:8px; margin:0 0 10px;}
+  .camera-controls[hidden], .camera-controls [hidden]{display:none;}
+  .camera-zoom{display:flex; align-items:center; gap:8px; font-size:13px;}
+  .camera-zoom input{width:110px; min-height:44px; accent-color:#FF8B24;}
+  .camera-controls button{border:1px solid #636970; color:#fff; background:#252A2F;}
+  .camera-controls button:disabled{opacity:.5;}
+  @media(max-height:500px){.scanner-foot{padding-top:6px; padding-bottom:6px;} .scanner-help{margin-bottom:6px;} .scanner-head{padding-top:6px; padding-bottom:6px;}}
+  @media(max-height:400px) and (orientation:landscape){
+    .scanner[open]{display:grid; grid-template-columns:minmax(0,1fr) 240px; grid-template-rows:auto minmax(0,1fr);}
+    .scanner-head{grid-column:1 / -1;}
+    .camera-view{grid-column:1; grid-row:2;}
+    .scanner-foot{grid-column:2; grid-row:2; padding:8px; overflow:auto;}
+    .scanner-help{display:none;}
+    .camera-controls button{padding:8px 10px;}
+  }
   .scanner-manual{border:1px solid #636970; color:#fff; background:transparent;}
   body.scanner-open{overflow:hidden;}
   .ghost{width:100%; margin-top:10px; border:1px solid var(--line); border-radius:12px; cursor:pointer;
@@ -206,13 +221,18 @@
     <button class="scanner-close" id="closeScanner" autofocus>✕ 閉じる</button>
     <h2 id="scannerTitle">バーコード読取</h2>
   </div>
-  <div class="camera-view">
+  <div class="camera-view" id="cameraView">
     <video id="cameraVideo" autoplay muted playsinline aria-label="読み取り用カメラ映像"></video>
-    <div class="camera-guide" aria-hidden="true"></div>
+    <div class="camera-guide" id="cameraGuide" aria-hidden="true"></div>
   </div>
   <div class="scanner-foot">
     <p class="scanner-message" id="scannerMessage" role="status">カメラを起動しています…</p>
-    <p class="scanner-help">バーコード全体を枠に合わせてください。<br>読み取ると自動で閉じて、一覧に登録します。</p>
+    <div class="camera-controls" id="cameraControls" hidden>
+      <label class="camera-zoom" id="cameraZoomControl" hidden>ズーム <input id="cameraZoom" type="range" min="1" max="3" step="0.1" value="1" aria-label="カメラのズーム"><output id="cameraZoomLabel" for="cameraZoom">1.0×</output></label>
+      <button id="cameraTorch" type="button" aria-pressed="false" hidden>ライトをつける</button>
+      <button id="switchCamera" type="button" hidden>カメラ切替</button>
+    </div>
+    <p class="scanner-help">バーコード全体を枠に入れ、少し離して静止してください。<br>ぼやけるときはレンズを拭き、距離やカメラを変えてください。<br>読み取ると自動で閉じて、一覧に登録します。</p>
     <button class="scanner-manual" id="scannerManual">番号を直接入力</button>
   </div>
 </dialog>
@@ -556,17 +576,139 @@ async function scanDetailedAreas(file,session){
 }
 
 /* カメラは1回の起動につき1件だけ登録。古い非同期処理は終了後に反映しない。 */
+function resetCameraControls(){
+  el('cameraControls').hidden=true;
+  el('cameraZoomControl').hidden=true;
+  el('cameraTorch').hidden=true;
+  el('switchCamera').hidden=true;
+  el('cameraTorch').setAttribute('aria-pressed','false');
+  el('cameraTorch').textContent='ライトをつける';
+  for(const id of ['cameraZoom','cameraTorch','switchCamera']) el(id).disabled=false;
+}
+function cameraSettings(track){
+  try{return track?.getSettings?.()||{};}catch{return {};}
+}
+async function applyCameraSetting(session,setting){
+  if(cameraSession!==session || !session.track?.applyConstraints) return false;
+  try{
+    // 画質補助は端末が対応する場合のみ。失敗しても通常のスキャンを続ける。
+    let constraints=session.appliedConstraints||session.captureConstraints||{};
+    // 一部Chromeでは getConstraints が直前の advanced だけを返すため、成功済みの制約を保持する。
+    if(!session.appliedConstraints){
+      try{constraints={...constraints,...session.track.getConstraints?.()};}catch{}
+    }
+    // applyConstraints は制約全体を置き換えるため、解像度・AF・ライトも維持する。
+    const advanced=(constraints.advanced||[]).map(entry=>Object.fromEntries(
+      Object.entries(entry).filter(([key])=>!(key in setting))
+    )).filter(entry=>Object.keys(entry).length);
+    const next={...constraints,advanced:[...advanced,setting]};
+    await session.track.applyConstraints(next);
+    if(cameraSession!==session) return false;
+    session.appliedConstraints=next;
+    return true;
+  }catch{return false;}
+}
+function showCameraControls(){
+  el('cameraControls').hidden=['cameraZoomControl','cameraTorch','switchCamera'].every(id=>el(id).hidden);
+}
+function displayCameraZoom(value){
+  el('cameraZoom').value=String(value);
+  el('cameraZoomLabel').textContent=Number(value).toFixed(1)+'×';
+}
+async function configureCamera(session,track){
+  let caps={};
+  try{caps=track?.getCapabilities?.()||{};}catch{}
+  session.capabilities=caps;
+  // focus と exposure を分け、一方の非対応で他方も失敗することを防ぐ。
+  for(const name of ['focusMode','exposureMode']){
+    if(cameraSession!==session) return;
+    if(Array.isArray(caps[name]) && caps[name].includes('continuous')){
+      await applyCameraSetting(session,{[name]:'continuous'});
+    }
+  }
+  if(cameraSession!==session) return;
+  const settings=cameraSettings(track), zoom=caps.zoom;
+  if(track?.applyConstraints && zoom && Number.isFinite(zoom.min) && Number.isFinite(zoom.max) && zoom.max>zoom.min){
+    // 過大なデジタルズームは細部を失うので、操作範囲を3倍までに抑える。
+    const min=zoom.min, max=Math.min(zoom.max,3), step=Number.isFinite(zoom.step)&&zoom.step>0?zoom.step:.1;
+    if(max>min){
+      session.zoom={min,max,step};
+      const input=el('cameraZoom');input.min=String(min);input.max=String(max);input.step=String(step);
+      displayCameraZoom(Math.max(min,Math.min(max,Number.isFinite(settings.zoom)?settings.zoom:min)));
+      el('cameraZoomControl').hidden=false;
+    }
+  }
+  if(track?.applyConstraints && caps.torch===true){
+    session.torch=settings.torch===true;
+    el('cameraTorch').hidden=false;
+    el('cameraTorch').setAttribute('aria-pressed',String(session.torch));
+    el('cameraTorch').textContent=session.torch?'ライトを消す':'ライトをつける';
+  }
+  showCameraControls();
+  try{
+    const devices=await navigator.mediaDevices.enumerateDevices?.();
+    if(cameraSession!==session) return;
+    session.cameras=(devices||[]).filter(device=>device.kind==='videoinput' && device.deviceId);
+    if(session.cameras.length>1){el('switchCamera').hidden=false;showCameraControls();}
+  }catch{} // カメラ一覧を取得できなくても、現在のカメラは利用できる。
+}
+async function changeCameraSetting(kind){
+  const session=cameraSession;
+  if(!session || !session.track || session.controlBusy) return;
+  let setting;
+  if(kind==='zoom'){
+    if(!session.zoom) return;
+    const {min,max,step}=session.zoom, value=Number(el('cameraZoom').value);
+    if(!Number.isFinite(value)) return;
+    setting={zoom:Math.max(min,Math.min(max,min+Math.round((value-min)/step)*step))};
+  }else{
+    if(session.capabilities?.torch!==true) return;
+    setting={torch:!session.torch};
+  }
+  session.controlBusy=true;
+  session.settingsVersion=(session.settingsVersion||0)+1;
+  for(const id of ['cameraZoom','cameraTorch','switchCamera']) el(id).disabled=true;
+  const previous=cameraSettings(session.track);
+  const applied=await applyCameraSetting(session,setting);
+  if(cameraSession!==session) return;
+  session.controlBusy=false;
+  for(const id of ['cameraZoom','cameraTorch','switchCamera']) el(id).disabled=false;
+  const settings=cameraSettings(session.track);
+  if(kind==='zoom'){
+    displayCameraZoom(Number.isFinite(settings.zoom)?settings.zoom:(applied?setting.zoom:(previous.zoom??session.zoom.min)));
+  }else{
+    session.torch=typeof settings.torch==='boolean'?settings.torch:(applied?setting.torch:session.torch);
+    el('cameraTorch').setAttribute('aria-pressed',String(session.torch));
+    el('cameraTorch').textContent=session.torch?'ライトを消す':'ライトをつける';
+  }
+  // レンズの設定前後の読取を混ぜて確定しない。
+  session.candidate='';
+  scannerMessage.textContent=applied?'バーコードにかざしてください':'このカメラでは設定を変更できませんでした。そのまま読み取れます。';
+}
+function updateCameraGuide(width,height){
+  const view=el('cameraView'), guide=el('cameraGuide');
+  const vw=view.clientWidth, vh=view.clientHeight;
+  if(!vw || !vh) return;
+  // object-fit:contain の黒帯を除いた映像の中にガイドを合わせる。
+  const scale=Math.min(vw/width,vh/height), dw=width*scale, dh=height*scale;
+  guide.style.left=((vw-dw)/2+dw*.06)+'px';
+  guide.style.top=((vh-dh)/2+dh*.35)+'px';
+  guide.style.width=(dw*.88)+'px';guide.style.height=(dh*.3)+'px';
+}
 function stopScanner(restoreFocus=true){
   const session=cameraSession;
   cameraSession=null;
   if(session){
     clearTimeout(session.timer);
     clearTimeout(session.startupTimer);
+    clearTimeout(session.muteTimer);
+    if(session.frameCallback!=null && cameraVideo.cancelVideoFrameCallback) cameraVideo.cancelVideoFrameCallback(session.frameCallback);
     if(session.stream) session.stream.getTracks().forEach(track=>track.stop());
     session.canvas.width=0; session.canvas.height=0;
   }
   cameraVideo.pause();
   cameraVideo.srcObject=null;
+  resetCameraControls();
   if(scanner.open) scanner.close();
   document.body.classList.remove('scanner-open');
   if(restoreFocus && session) el('capBtn').focus({preventScroll:true});
@@ -585,36 +727,46 @@ function cameraErrorMessage(error){
 async function scanCameraFrame(session){
   if(cameraSession!==session) return;
   try{
-    if(cameraVideo.readyState>=2 && cameraVideo.videoWidth && cameraVideo.videoHeight){
+    const frameTime=session.usesFrameCallback?session.presentedFrames:cameraVideo.currentTime;
+    if(!session.controlBusy && (!session.usesFrameCallback || session.presentedFrames>0) &&
+       cameraVideo.readyState>=2 && cameraVideo.videoWidth && cameraVideo.videoHeight &&
+       (!Number.isFinite(frameTime) || frameTime!==session.lastFrameTime)){
+      session.lastFrameTime=frameTime;
       clearTimeout(session.startupTimer);
       const width=cameraVideo.videoWidth, height=cameraVideo.videoHeight;
-      // 中央を優先し、定期的に全体も読む。キャンバスを再利用し処理量を抑える。
-      const fullFrame=session.frames++%4===3;
+      updateCameraGuide(width,height);
+      // 中央・全体の両方で未加工と強調画像を試す。細い線を残し、処理量は制限する。
+      const pass=session.frames++%4, fullFrame=pass>=2;
       const sy=fullFrame?0:Math.round(height*.2);
       const sh=fullFrame?height:Math.round(height*.6);
-      const scale=Math.min(1,1920/Math.max(width,sh));
+      const scale=Math.min(1,2560/Math.max(width,sh),Math.sqrt(2000000/(width*sh)));
       const canvas=session.canvas;
-      const cw=Math.max(1,Math.round(width*scale)), ch=Math.max(1,Math.round(sh*scale));
+      const cw=Math.max(1,Math.floor(width*scale)), ch=Math.max(1,Math.floor(sh*scale));
       if(canvas.width!==cw) canvas.width=cw;
       if(canvas.height!==ch) canvas.height=ch;
       const context=canvas.getContext('2d',{willReadFrequently:true});
       context.drawImage(cameraVideo,0,sy,width,sh,0,0,cw,ch);
       let frame=context.getImageData(0,0,cw,ch);
-      if(session.frames%2===0) frame=enhanceContrast(frame);
+      if(pass%2===1) frame=enhanceContrast(frame);
+      const version=session.settingsVersion;
       const result=pickMachineBarcode(await decodeBarcodes(frame,{...READER_OPTS,tryDownscale:false}));
       if(cameraSession!==session) return;
+      if(version!==session.settingsVersion){
+        session.timer=setTimeout(()=>scanCameraFrame(session),220);
+        return;
+      }
       session.errors=0;
       const now=Date.now();
       if(result){
-        // 別フレームでも同じ機械番号を確認してから登録する。
-        if(session.candidate===result.text && now-session.candidateAt<1800){
+        // 別の映像フレームで確認。低速端末の解析時間にも余裕を持たせる。
+        if(session.candidate===result.text && now-session.candidateAt<5000){
           stopScanner(false);
           addScan(result.text,result.format);
           return;
         }
         session.candidate=result.text; session.candidateAt=now;
         scannerMessage.textContent='番号を確認中…そのままかざしてください';
-      }else if(now-session.candidateAt>=1800){
+      }else if(now-session.candidateAt>=5000){
         session.candidate='';
         scannerMessage.textContent='バーコードにかざしてください';
       }
@@ -629,36 +781,62 @@ async function scanCameraFrame(session){
   }
   if(cameraSession===session) session.timer=setTimeout(()=>scanCameraFrame(session),220);
 }
-async function startScanner(){
+async function startScanner(deviceId=''){
   if(cameraSession || fileScanBusy || !readBarcodes) return;
   if(!navigator.mediaDevices?.getUserMedia || typeof scanner.showModal!=='function'){
     showScanNotice('この環境では連続スキャンを使えません。SafariまたはChromeでHTTPSの公開URLを開くか、「アルバムから選ぶ」をお使いください。',true);
     return;
   }
-  const session={stream:null,timer:null,startupTimer:null,canvas:document.createElement('canvas'),frames:0,errors:0,candidate:'',candidateAt:0};
+  const session={deviceId,stream:null,track:null,timer:null,startupTimer:null,muteTimer:null,canvas:document.createElement('canvas'),frames:0,errors:0,candidate:'',candidateAt:0};
   cameraSession=session;
+  resetCameraControls();
   el('scanNotice').hidden=true;
   scannerMessage.textContent='カメラを起動しています…';
   try{
     scanner.showModal();
     document.body.classList.add('scanner-open');
     cameraVideo.muted=true;
-    const stream=await navigator.mediaDevices.getUserMedia({
-      audio:false,
-      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:15,max:30}}
-    });
+    const portrait=window.innerHeight>window.innerWidth;
+    const selection=deviceId?{deviceId:{exact:deviceId}}:{facingMode:{ideal:'environment'}};
+    let stream;
+    session.captureConstraints={...selection,width:{ideal:portrait?1440:2560},height:{ideal:portrait?2560:1440},frameRate:{ideal:30}};
+    try{
+      stream=await navigator.mediaDevices.getUserMedia({audio:false,video:session.captureConstraints});
+    }catch(error){
+      if(cameraSession!==session) return;
+      if(error?.name!=='OverconstrainedError') throw error;
+      session.captureConstraints=selection;
+      stream=await navigator.mediaDevices.getUserMedia({audio:false,video:selection});
+    }
     // 許可ダイアログを待っている間に閉じた場合も、届いたストリームを確実に停止する。
     if(cameraSession!==session){stream.getTracks().forEach(track=>track.stop()); return;}
     session.stream=stream;
+    session.track=stream.getVideoTracks()[0];
     stream.getVideoTracks().forEach(track=>{
       track.addEventListener('ended',()=>failScanner(session,'カメラが停止しました。「スキャン」で再開してください。'));
-      track.addEventListener('mute',()=>failScanner(session,'カメラが一時停止しました。スキャンボタンから再開してください。'));
+      track.addEventListener('mute',()=>{
+        if(cameraSession!==session) return;
+        clearTimeout(session.muteTimer);
+        session.muteTimer=setTimeout(()=>failScanner(session,'カメラが一時停止しました。スキャンボタンから再開してください。'),3000);
+      });
+      track.addEventListener('unmute',()=>{clearTimeout(session.muteTimer);});
     });
     cameraVideo.srcObject=stream;
     session.startupTimer=setTimeout(()=>failScanner(session,'カメラ映像を表示できませんでした。もう一度スキャンするか、写真から読み取ってください。'),15000);
     await cameraVideo.play();
     if(cameraSession!==session) return;
+    if(typeof cameraVideo.requestVideoFrameCallback==='function'){
+      session.usesFrameCallback=true;session.presentedFrames=0;
+      const onFrame=()=>{
+        if(cameraSession!==session) return;
+        session.presentedFrames++;
+        session.frameCallback=cameraVideo.requestVideoFrameCallback(onFrame);
+      };
+      session.frameCallback=cameraVideo.requestVideoFrameCallback(onFrame);
+    }
     scannerMessage.textContent='バーコードにかざしてください';
+    // 任意設定やデバイス一覧の応答が遅くても、映像の読み取りは開始する。
+    configureCamera(session,session.track);
     scanCameraFrame(session);
   }catch(error){
     if(cameraSession===session) failScanner(session,cameraErrorMessage(error));
@@ -685,7 +863,19 @@ async function handleFile(file){
   finally{if(fileScanSession===session)cancelFileScan();}
 }
 
-el('capBtn').addEventListener('click',startScanner);
+el('capBtn').addEventListener('click',()=>startScanner());
+el('cameraZoom').addEventListener('input',()=>{el('cameraZoomLabel').textContent=Number(el('cameraZoom').value).toFixed(1)+'×';});
+el('cameraZoom').addEventListener('change',()=>changeCameraSetting('zoom'));
+el('cameraTorch').addEventListener('click',()=>changeCameraSetting('torch'));
+el('switchCamera').addEventListener('click',()=>{
+  const session=cameraSession;
+  if(!session || session.controlBusy || !session.cameras?.length) return;
+  const current=cameraSettings(session.track).deviceId||session.deviceId;
+  const index=session.cameras.findIndex(device=>device.deviceId===current);
+  const next=session.cameras[(index+1)%session.cameras.length];
+  stopScanner(false);
+  startScanner(next.deviceId);
+});
 el('closeScanner').addEventListener('click',()=>stopScanner());
 scanner.addEventListener('cancel',event=>{event.preventDefault(); stopScanner();});
 scanner.addEventListener('close',()=>{if(!scanner.open && cameraSession) stopScanner();});
