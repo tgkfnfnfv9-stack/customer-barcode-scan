@@ -49,7 +49,7 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
       drawImage:(...args)=>canvasDraws.push({canvas:this,args}),
       getImageData:(x,y,width,height)=>{
         frameReads.push({width,height});
-        return {data:new Uint8ClampedArray([90,120,150,255,90,120,150,255]),width,height};
+        return {data:new Uint8ClampedArray([90,120,150,255,190,210,230,255]),width,height};
       }
     };}
   }
@@ -78,7 +78,7 @@ function app({getUserMedia,decode,storedHistory,stockResponse}={}){
   };
   context=vm.createContext(sandbox);
   vm.runInContext(source+`\nreadBarcodes=testDecode; updateScanButton(); render();
-    this.api={startScanner,stopScanner,scanCameraFrame,handleFile,addScan,render,submitManual,copyText,formatPrice,publicStock,initialize,refreshHistory,
+    this.api={startScanner,stopScanner,scanCameraFrame,enhanceContrast,handleFile,addScan,render,submitManual,copyText,formatPrice,publicStock,initialize,refreshHistory,
       setHistory:items=>{history=items;render();},setInit:fn=>{initLib=fn;},
       session:()=>cameraSession,history:()=>history,loadStock,advance:ms=>{testAdvance(ms);},
       setDecoder:fn=>{readBarcodes=fn;},setMedia:fn=>{navigator.mediaDevices.getUserMedia=fn;}};`,context);
@@ -407,7 +407,7 @@ test('cancelled photo work leaves a ready status when returning to the page',asy
 });
 
 // Camera acquisition and frame-processing regressions shared by customer and staff scanners.
-test('camera requests high-resolution rear video with orientation-aware dimensions',async()=>{
+test('camera requests sensor-oriented rear video independent of viewport orientation',async()=>{
   for(const portrait of [true,false]){
     const requests=[];
     const a=app({getUserMedia:async constraints=>{requests.push(constraints);return a.camera;}});
@@ -417,8 +417,8 @@ test('camera requests high-resolution rear video with orientation-aware dimensio
     const request=requests[0];
     assert.equal(request.audio,false);
     assert.equal(request.video.facingMode.ideal,'environment');
-    assert.equal(request.video.width.ideal,portrait?1440:2560);
-    assert.equal(request.video.height.ideal,portrait?2560:1440);
+    assert.equal(request.video.width.ideal,1920);
+    assert.equal(request.video.height.ideal,1080);
     assert.equal(request.video.frameRate.ideal,30);
     a.api.stopScanner();
   }
@@ -480,14 +480,16 @@ test('continuous focus and exposure are independent optional improvements',async
   a.api.stopScanner();
 });
 
-test('capability and device-enumeration failures leave basic scanning usable',async()=>{
-  for(const failing of ['capabilities','settings','enumeration','missing methods']){
+test('missing or failing capability and constraint APIs leave basic scanning usable',async()=>{
+  for(const failing of ['capabilities','constraints','missing methods']){
     const a=app({decode:async()=>code('P009000')});
     if(failing==='capabilities')a.camera.track.getCapabilities=()=>{throw new Error('driver capabilities unavailable');};
-    if(failing==='settings')a.camera.track.getSettings=()=>{throw new Error('driver settings unavailable');};
-    if(failing==='enumeration')a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>{throw new Error('enumeration unavailable');};
+    if(failing==='constraints'){
+      a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous']});
+      a.camera.track.getConstraints=()=>{throw new Error('driver constraints unavailable');};
+    }
     if(failing==='missing methods'){
-      delete a.camera.track.getCapabilities;delete a.camera.track.getSettings;delete a.camera.track.applyConstraints;
+      delete a.camera.track.getCapabilities;delete a.camera.track.getConstraints;delete a.camera.track.applyConstraints;
     }
     await a.api.startScanner();await flush();
     assert.equal(a.get('scanner').open,true,failing);
@@ -555,143 +557,58 @@ test('expired candidates still require a second fresh matching frame',async()=>{
   await a.tick();assert.equal(a.api.history()[0]?.code,'P009000');
 });
 
-test('central and full camera frames each receive original and contrast passes within the pixel budget',async()=>{
-  const decoded=[];
-  const a=app({decode:async frame=>{decoded.push({width:frame.width,height:frame.height,pixel:[...frame.data.slice(0,3)]});return [];}});
-  a.get('cameraVideo').videoWidth=3840;a.get('cameraVideo').videoHeight=2160;
-  await a.api.startScanner();await flush();
-  for(let i=0;i<3;i++)await a.tick();
-  assert.equal(decoded.length,4);
-  assert.deepEqual(a.canvasDraws.map(draw=>draw.args[2]),[432,432,0,0]);
-  assert.deepEqual(a.canvasDraws.map(draw=>draw.args[4]),[1296,1296,2160,2160]);
-  assert.deepEqual(decoded[0].pixel,[90,120,150]);
-  assert.notDeepEqual(decoded[1].pixel,decoded[0].pixel);
-  assert.deepEqual(decoded[2].pixel,decoded[0].pixel,'full frame retains an unmodified decode attempt');
-  assert.deepEqual(decoded[3].pixel,decoded[1].pixel);
-  assert.ok(decoded.some(frame=>frame.width>1920),'high-resolution narrow bars are retained');
-  for(const frame of decoded){
-    assert.ok(Math.max(frame.width,frame.height)<=2560);
-    assert.ok(frame.width*frame.height<=2100000,'large camera frames respect the memory and CPU budget');
-  }
-  a.api.stopScanner();
-});
-
-test('supported camera controls apply bounded zoom and toggle the torch',async()=>{
-  const a=app();
-  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:8,step:.5},torch:true});
-  await a.api.startScanner();await flush();
-  assert.equal(a.get('cameraControls').hidden,false);
-  assert.equal(a.get('cameraZoomControl').hidden,false);
-  assert.equal(a.get('cameraTorch').hidden,false);
-  assert.equal(a.get('switchCamera').hidden,true);
-  assert.equal(a.get('cameraZoom').max,'3');
-  a.get('cameraZoom').value='2.4';a.get('cameraZoom').handlers.input();
-  assert.equal(a.get('cameraZoomLabel').textContent,'2.4×');
-  await a.get('cameraZoom').handlers.change();
-  assert.equal(a.camera.track.getSettings().zoom,2.5);
-  assert.equal(a.get('cameraZoomLabel').textContent,'2.5×');
-  a.get('cameraZoom').value='9';await a.get('cameraZoom').handlers.change();
-  assert.equal(a.camera.track.getSettings().zoom,3);
-  await a.get('cameraTorch').handlers.click();
-  assert.equal(a.camera.track.getSettings().torch,true);
-  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'true');
-  await a.get('cameraTorch').handlers.click();
-  assert.equal(a.camera.track.getSettings().torch,false);
-  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false');
-  a.api.stopScanner();
-  assert.equal(a.get('cameraControls').hidden,true);
-});
-
-test('unsupported camera controls remain hidden',async()=>{
-  const a=app();await a.api.startScanner();await flush();
-  for(const id of ['cameraControls','cameraZoomControl','cameraTorch','switchCamera'])assert.equal(a.get(id).hidden,true,id);
-  a.api.stopScanner();
-});
-
-test('failed zoom and torch requests restore controls and keep scanning',async()=>{
-  const a=app();
-  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:3,step:.1},torch:true});
-  a.camera.track.applyConstraints=async()=>{throw new Error('camera driver rejected setting');};
-  await a.api.startScanner();await flush();
-  a.get('cameraZoom').value='2';await a.get('cameraZoom').handlers.change();
-  assert.equal(a.get('cameraZoom').value,'1');
-  assert.equal(a.get('cameraZoomLabel').textContent,'1.0×');
-  await a.get('cameraTorch').handlers.click();
-  assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false');
-  for(const id of ['cameraZoom','cameraTorch','switchCamera'])assert.equal(a.get(id).disabled,false,id);
-  assert.equal(a.get('scanner').open,true);
-  const frames=a.frameReads.length;await a.tick();assert.equal(a.frameReads.length,frames+1);
-  a.api.stopScanner();
-});
-
-test('late zoom or torch completion cannot overwrite controls belonging to a newer camera',async()=>{
-  for(const kind of ['zoom','torch']){
-    const pending=deferred(),a=app();
-    const capabilities={zoom:{min:1,max:3,step:.25},torch:true};
-    a.camera.track.getCapabilities=()=>capabilities;
-    a.camera.track.applyConstraints=()=>pending.promise;
+test('native central strips and full frames retain original and normalized passes within the pixel budget',async()=>{
+  for(const [width,height] of [[3840,2160],[2160,3840],[7680,4320]]){
+    const decoded=[];
+    const a=app({decode:async(frame,options)=>{decoded.push({width:frame.width,height:frame.height,pixel:[...frame.data.slice(0,3)],options});return [];}});
+    a.get('cameraVideo').videoWidth=width;a.get('cameraVideo').videoHeight=height;
     await a.api.startScanner();await flush();
-    a.get('cameraZoom').value='2';
-    const changing=kind==='zoom'?a.get('cameraZoom').handlers.change():a.get('cameraTorch').handlers.click();
-    assert.equal(a.get('cameraZoom').disabled,true);
-    a.api.stopScanner();
-    const next=stream({capabilities,settings:{deviceId:'rear-next',zoom:1.25,torch:false}});
-    a.api.setMedia(async()=>next);await a.api.startScanner();await flush();
-    const label=a.get('cameraZoomLabel').textContent;
-    pending.resolve();await changing;await flush();
-    assert.equal(a.get('cameraZoomLabel').textContent,label,kind);
-    assert.equal(a.get('cameraZoom').value,'1.25',kind);
-    assert.equal(a.get('cameraTorch').attributes['aria-pressed'],'false',kind);
-    assert.equal(a.get('cameraZoom').disabled,false,kind);
-    assert.equal(next.track.stopped,false,kind);
+    for(let i=0;i<3;i++)await a.tick();
+    assert.equal(decoded.length,4);
+    for(let index=0;index<4;index++){
+      const draw=a.canvasDraws[index].args,frame=decoded[index];
+      const [,sx,sy,sw,sh,,,cw,ch]=draw;
+      assert.ok(frame.width*frame.height<=1200000,'each pass respects the memory and CPU budget');
+      assert.equal(frame.options.tryDownscale,false,'preserved barcode detail is not downscaled inside the reader');
+      if(index<2){
+        assert.equal(cw,sw,'central strip keeps original horizontal pixels');
+        assert.equal(ch,sh,'central strip keeps original vertical pixels');
+        assert.ok(Math.abs(sx+sw/2-width/2)<=1,'strip is horizontally centered');
+        assert.ok(Math.abs(sy+sh/2-height/2)<=1,'strip is vertically centered');
+        assert.ok(sw<=3840);assert.ok(sh<height);
+      }else{
+        assert.equal(sx,0);assert.equal(sy,0);
+        assert.equal(sw,width);assert.equal(sh,height,'full-frame pass covers labels outside the center');
+        assert.ok(Math.max(cw,ch)<=1920);
+      }
+    }
+    assert.deepEqual(decoded[0].pixel,[90,120,150]);
+    assert.notDeepEqual(decoded[1].pixel,decoded[0].pixel);
+    assert.deepEqual(decoded[2].pixel,decoded[0].pixel,'full frame retains an unmodified decode attempt');
+    assert.deepEqual(decoded[3].pixel,decoded[1].pixel);
+    assert.ok(decoded[0].width>1920,'high-resolution narrow bars are preserved');
     a.api.stopScanner();
   }
 });
 
-test('late camera configuration and enumeration cannot reveal obsolete controls',async()=>{
-  for(const pendingStage of ['focus','enumeration']){
-    const pending=deferred(),a=app();
-    if(pendingStage==='focus'){
-      a.camera.track.getCapabilities=()=>({focusMode:['continuous'],zoom:{min:1,max:3},torch:true});
-      a.camera.track.applyConstraints=()=>pending.promise;
-    }else a.sandbox.navigator.mediaDevices.enumerateDevices=()=>pending.promise;
-    await a.api.startScanner();await flush();a.api.stopScanner();
-    const next=stream();a.api.setMedia(async()=>next);
-    a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[];
+test('the visible guide stays inside the native decoded strip in portrait and landscape views',async()=>{
+  for(const [width,height,vw,vh] of [[3840,2160,390,560],[2160,3840,390,560],[7680,4320,800,350]]){
+    const a=app(),view=a.get('cameraView');
+    Object.defineProperties(view,{clientWidth:{value:vw},clientHeight:{value:vh}});
+    a.get('cameraVideo').videoWidth=width;a.get('cameraVideo').videoHeight=height;
     await a.api.startScanner();await flush();
-    pending.resolve([{kind:'videoinput',deviceId:'rear-old'},{kind:'videoinput',deviceId:'front-old'}]);
-    await flush();
-    for(const id of ['cameraControls','cameraZoomControl','cameraTorch','switchCamera'])assert.equal(a.get(id).hidden,true,pendingStage+' '+id);
-    assert.equal(next.track.stopped,false);
+    const [,sx,sy,sw,sh]=a.canvasDraws[0].args;
+    const scale=Math.min(vw/width,vh/height);
+    const cropLeft=(vw-width*scale)/2+sx*scale,cropTop=(vh-height*scale)/2+sy*scale;
+    const guide=a.get('cameraGuide').style;
+    const left=parseFloat(guide.left),top=parseFloat(guide.top),gw=parseFloat(guide.width),gh=parseFloat(guide.height);
+    assert.ok(gw>0&&gh>0,'guide has a visible area');
+    assert.ok(left>=cropLeft&&top>=cropTop,'guide begins inside decoded pixels');
+    assert.ok(left+gw<=cropLeft+sw*scale&&top+gh<=cropTop+sh*scale,'guide stays inside decoded pixels');
+    assert.ok(Math.abs(left+gw/2-(cropLeft+sw*scale/2))<.01);
+    assert.ok(Math.abs(top+gh/2-(cropTop+sh*scale/2))<.01);
     a.api.stopScanner();
   }
-});
-
-test('camera switching releases the old track and requests the next exact video device',async()=>{
-  const requests=[],opened=[];
-  const a=app({getUserMedia:async constraints=>{
-    requests.push(constraints);
-    const camera=stream({settings:{deviceId:constraints.video.deviceId?.exact||'rear-main'}});
-    opened.push(camera);return camera;
-  }});
-  a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[
-    {kind:'audioinput',deviceId:'microphone'},
-    {kind:'videoinput',deviceId:'rear-main',label:'Back main'},
-    {kind:'videoinput',deviceId:'rear-wide',label:'Back wide'},
-    {kind:'videoinput',deviceId:'front',label:'Front'}
-  ];
-  await a.api.startScanner();await flush();
-  assert.equal(a.get('switchCamera').hidden,false);
-  a.get('switchCamera').handlers.click();await flush();
-  assert.equal(opened[0].track.stopped,true);
-  assert.equal(requests[1].video.deviceId.exact,'rear-wide');
-  assert.equal(requests[1].video.facingMode,undefined);
-  assert.equal(a.get('cameraVideo').srcObject,opened[1]);
-  a.get('switchCamera').handlers.click();await flush();
-  assert.equal(opened[1].track.stopped,true);
-  assert.equal(requests[2].video.deviceId.exact,'front');
-  assert.equal(a.get('scanner').open,true);
-  a.api.stopScanner();
 });
 
 test('video frame callbacks prevent duplicate-frame confirmation and are cancelled on stop',async()=>{
@@ -714,88 +631,124 @@ test('video frame callbacks prevent duplicate-frame confirmation and are cancell
   obsolete();assert.equal(callbacks.size,0,'late callbacks cannot resubscribe after stopping');
 });
 
-test('a decode started before a zoom change cannot confirm a candidate afterward',async()=>{
-  const pending=deferred();let calls=0;
-  const a=app({decode:()=>++calls===2?pending.promise:Promise.resolve(code('P009000'))});
-  a.camera.track.getCapabilities=()=>({zoom:{min:1,max:3,step:.1}});
-  await a.api.startScanner();await flush();
-  const decoding=a.tick();await flush();assert.equal(calls,2);
-  a.get('cameraZoom').value='2';await a.get('cameraZoom').handlers.change();
-  pending.resolve(code('P009000'));await decoding;
-  assert.equal(a.api.history().length,0,'the result from before the setting change is discarded');
-  await a.tick();assert.equal(a.api.history().length,0,'the first new image becomes a candidate');
-  await a.tick();assert.equal(a.api.history()[0]?.code,'P009000');
+
+test('automatic scanning exposes no camera controls and never changes zoom, light or camera selection',async()=>{
+  for(const id of ['cameraControls','cameraZoomControl','cameraZoom','cameraZoomLabel','cameraTorch','switchCamera']){
+    assert.ok(!new RegExp('\\bid="'+id+'"').test(html),'removed camera control: '+id);
+  }
+  const requests=[];let enumerations=0;
+  const a=app({getUserMedia:async value=>{requests.push(value);return a.camera;},decode:async()=>code('P009000')});
+  a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous'],zoom:{min:1,max:8,step:.1},torch:true});
+  a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>{enumerations++;return [{kind:'videoinput',deviceId:'rear-other'}];};
+  await a.api.startScanner();await flush();await a.tick();
+  assert.equal(a.api.history()[0]?.code,'P009000','automatic recognition needs no camera controls');
+  assert.equal(enumerations,0);
+  assert.equal(requests.length,1);
+  assert.equal(requests[0].video.deviceId,undefined);
+  assert.equal(requests[0].video.facingMode.ideal,'environment');
+  for(const applied of a.camera.constraints){
+    for(const value of [applied,...(applied.advanced||[])]){
+      for(const key of ['zoom','torch','deviceId'])assert.equal(value[key],undefined,key+' must not be changed');
+    }
+  }
 });
 
-test('camera adjustments retain requested resolution and previously selected focus, exposure and light',async()=>{
-  for(const hasGetConstraints of [false,true]){
+test('automatic camera setup leaves manual-only focus and exposure modes untouched',async()=>{
+  const a=app();
+  a.camera.track.getCapabilities=()=>({focusMode:['manual','single-shot'],exposureMode:['manual'],focusDistance:{min:0,max:100},zoom:{min:1,max:8},torch:true});
+  await a.api.startScanner();await flush();
+  assert.equal(a.camera.constraints.length,0,'unsupported continuous modes do not force manual camera settings');
+  assert.ok(a.frameReads.length>0);
+  assert.equal(a.get('scanner').open,true);
+  a.api.stopScanner();
+});
+
+test('late automatic focus completion cannot configure or disturb a newer camera session',async()=>{
+  const pending=deferred(),a=app(),oldCalls=[];
+  const capabilities={focusMode:['continuous'],exposureMode:['continuous']};
+  a.camera.track.getCapabilities=()=>capabilities;
+  a.camera.track.applyConstraints=value=>{oldCalls.push(value);return pending.promise;};
+  await a.api.startScanner();await flush();
+  a.api.stopScanner();
+  const next=stream({capabilities});a.api.setMedia(async()=>next);
+  await a.api.startScanner();await flush();
+  const nextSession=a.api.session(),newCalls=next.constraints.length;
+  pending.resolve();await flush();
+  assert.equal(oldCalls.length,1,'obsolete setup never proceeds from focus to exposure');
+  assert.equal(next.constraints.length,newCalls);
+  assert.equal(a.api.session(),nextSession);
+  assert.equal(next.track.stopped,false);
+  assert.equal(a.get('scanner').open,true);
+  a.api.stopScanner();
+});
+
+test('automatic focus and exposure preserve capture quality despite incomplete constraint reports',async()=>{
+  for(const reported of ['missing method','complete','advanced only']){
     const a=app();
-    a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous'],zoom:{min:1,max:3,step:.5},torch:true});
-    if(hasGetConstraints)a.camera.track.getConstraints=()=>a.camera.constraints.at(-1)||{
-      facingMode:{ideal:'environment'},width:{ideal:1440},height:{ideal:2560},frameRate:{ideal:30}
+    a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous']});
+    if(reported!=='missing method')a.camera.track.getConstraints=()=>{
+      const applied=a.camera.constraints.at(-1);
+      if(applied)return reported==='advanced only'?{advanced:applied.advanced}:applied;
+      return {facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}};
     };
     await a.api.startScanner();await flush();
-    await a.get('cameraTorch').handlers.click();
-    a.get('cameraZoom').value='2.5';await a.get('cameraZoom').handlers.change();
-    const applied=a.camera.constraints.at(-1);
-    assert.equal(applied.width?.ideal,1440);
-    assert.equal(applied.height?.ideal,2560);
-    assert.equal(applied.frameRate?.ideal,30);
-    const values=Object.assign({},...applied.advanced);
-    assert.equal(values.focusMode,'continuous');
-    assert.equal(values.exposureMode,'continuous');
-    assert.equal(values.torch,true);
-    assert.equal(values.zoom,2.5);
-    a.get('cameraZoom').value='3';await a.get('cameraZoom').handlers.change();
-    const zooms=a.camera.constraints.at(-1).advanced.filter(value=>Object.hasOwn(value,'zoom'));
-    assert.equal(zooms.length,1,'new zoom replaces the obsolete constraint');
-    assert.equal(zooms[0].zoom,3);
+    assert.equal(a.camera.constraints.length,2,reported);
+    for(const applied of a.camera.constraints){
+      assert.equal(applied.width?.ideal,1920,reported+' capture width');
+      assert.equal(applied.height?.ideal,1080,reported+' capture height');
+      assert.equal(applied.frameRate?.ideal,30,reported+' capture frame rate');
+    }
+    const values=Object.assign({},...a.camera.constraints.at(-1).advanced);
+    assert.equal(values.focusMode,'continuous',reported);
+    assert.equal(values.exposureMode,'continuous',reported);
     a.api.stopScanner();
   }
 });
 
-test('manual camera choices keep cycling when the driver omits its current device ID',async()=>{
-  const requests=[];
-  const a=app({getUserMedia:async constraints=>{
-    requests.push(constraints);return stream({settings:{}});
+test('automatic focus does not restore acquisition constraints rejected during camera fallback',async()=>{
+  let requests=0;
+  const a=app({getUserMedia:async()=>{
+    if(++requests===1)throw Object.assign(new Error('resolution unsupported'),{name:'OverconstrainedError'});
+    return a.camera;
   }});
-  a.sandbox.navigator.mediaDevices.enumerateDevices=async()=>[
-    {kind:'videoinput',deviceId:'rear-main'},
-    {kind:'videoinput',deviceId:'rear-wide'},
-    {kind:'videoinput',deviceId:'front'}
-  ];
+  a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous']});
   await a.api.startScanner();await flush();
-  a.get('switchCamera').handlers.click();await flush();
-  a.get('switchCamera').handlers.click();await flush();
-  a.get('switchCamera').handlers.click();await flush();
-  const selected=requests.slice(1).map(value=>value.video.deviceId.exact);
-  assert.equal(new Set(selected).size,3,'each manual choice reaches a different camera');
+  assert.equal(requests,2);
+  assert.equal(a.camera.constraints.length,2);
+  for(const applied of a.camera.constraints){
+    for(const key of ['width','height','frameRate'])assert.equal(applied[key],undefined,'rejected '+key+' is not reapplied');
+    assert.equal(applied.facingMode.ideal,'environment');
+  }
+  assert.ok(a.frameReads.length>0);
   a.api.stopScanner();
 });
 
-test('partial Chromium constraint reports cannot discard resolution or earlier camera settings',async()=>{
+test('automatic contrast keeps bright and dark barcode bars distinct and expands low contrast',()=>{
   const a=app();
-  a.camera.track.getCapabilities=()=>({focusMode:['continuous'],exposureMode:['continuous'],zoom:{min:1,max:3,step:.5},torch:true});
-  a.camera.track.getConstraints=()=>{
-    const applied=a.camera.constraints.at(-1);
-    // Chromium may report only image-capture constraints after applyConstraints.
-    return applied?{advanced:applied.advanced}:{facingMode:{ideal:'environment'},width:{ideal:1440},height:{ideal:2560},frameRate:{ideal:30}};
-  };
-  await a.api.startScanner();await flush();
-  assert.equal(a.camera.constraints.length,2,'focus and exposure configured independently');
-  assert.equal(a.camera.track.getConstraints().width,undefined,'driver now omits acquisition constraints');
-  await a.get('cameraTorch').handlers.click();
-  a.get('cameraZoom').value='2.5';await a.get('cameraZoom').handlers.change();
-  assert.equal(a.camera.constraints.length,4);
-  for(const applied of a.camera.constraints){
-    assert.equal(applied.width?.ideal,1440,'each adjustment preserves capture width');
-    assert.equal(applied.height?.ideal,2560,'each adjustment preserves capture height');
-    assert.equal(applied.frameRate?.ideal,30,'each adjustment preserves capture frame rate');
+  for(const [dark,light] of [[130,140],[210,235],[20,40]]){
+    const data=new Uint8ClampedArray(400);
+    for(let pixel=0;pixel<100;pixel++){
+      const gray=pixel<50?dark:light;
+      data.set([gray,gray,gray,255],pixel*4);
+    }
+    const enhanced=a.api.enhanceContrast({data,width:100,height:1});
+    const darkResult=enhanced.data[0],lightResult=enhanced.data[50*4];
+    assert.ok(lightResult>darkResult,`${dark}/${light}: enhancement retains distinct bars and background`);
+    assert.ok(lightResult-darkResult>light-dark,`${dark}/${light}: contrast improves without clipping both tones together`);
+    for(let pixel=0;pixel<100;pixel++)assert.equal(enhanced.data[pixel*4+3],255,'alpha retained');
   }
-  const values=Object.assign({},...a.camera.constraints.at(-1).advanced);
-  assert.equal(values.focusMode,'continuous');
-  assert.equal(values.exposureMode,'continuous');
-  assert.equal(values.torch,true);
-  assert.equal(values.zoom,2.5);
-  a.api.stopScanner();
+});
+
+test('automatic contrast does not amplify a flat frame or low-level sensor noise',()=>{
+  const a=app();
+  for(const range of [0,6]){
+    const data=new Uint8ClampedArray(400);
+    for(let pixel=0;pixel<100;pixel++){
+      const gray=127+(range?pixel%(range+1):0);
+      data.set([gray,gray,gray,255],pixel*4);
+    }
+    const original=[...data];
+    const enhanced=a.api.enhanceContrast({data,width:100,height:1});
+    assert.deepEqual([...enhanced.data],original,'flat or noisy frames remain unchanged');
+  }
 });

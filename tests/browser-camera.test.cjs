@@ -7,7 +7,8 @@ const {chromium}=require('playwright');
 
 const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
 // Observe the actual embedded WASM reader without substituting its results.
-const instrumented=html.replace('readBarcodes=mod.readBarcodes;',`readBarcodes=async (input,options)=>{
+const instrumented=html.replace('readBarcodes=mod.readBarcodes;',`window.__originalReader=mod.readBarcodes;window.__readerOptions=READER_OPTS;window.__enhanceContrast=enhanceContrast;
+readBarcodes=async (input,options)=>{
   const results=await mod.readBarcodes(input,options);
   window.__decodes.push({width:input.width,height:input.height,texts:results.map(result=>result.text)});
   if(window.__cameraTest.holdDecodeAt===window.__decodes.length) await new Promise(resolve=>{window.__cameraTest.releaseDecode=resolve;});
@@ -34,26 +35,38 @@ async function fixture(t,options={}){
     const state=window.__cameraTest={streams:[],requests:[],constraints:[],holdDecodeAt:options.holdDecodeAt};
     // Test-only Code 39 generator: nine alternating bars/spaces, 3:1 wide:narrow.
     const patterns={'*':0x094,P:0x052,0:0x034,9:0x064,1:0x121,2:0x061};
-    function draw(canvas,frame){
+    function picture(){
+      const canvas=document.createElement('canvas');
+      canvas.width=options.width||1920;canvas.height=options.height||1080;
       const ctx=canvas.getContext('2d');
-      ctx.fillStyle=options.lowContrast?'rgb(162,162,162)':'white';
+      const light=options.light??(options.lowContrast?162:255),dark=options.dark??(options.lowContrast?112:0);
+      ctx.fillStyle=`rgb(${light},${light},${light})`;
       ctx.fillRect(0,0,canvas.width,canvas.height);
       if(!options.blank){
+        const bars=document.createElement('canvas');bars.width=canvas.width;bars.height=canvas.height;
+        const barContext=bars.getContext('2d');
         const narrow=options.narrow||3,code='*P009000*';
         const barWidth=(code.length*16-1)*narrow;
         let x=Math.floor((canvas.width-barWidth)/2);
         const height=options.edge?Math.max(70,Math.floor(canvas.height*.08)):140;
         const y=options.edge?Math.floor(canvas.height*.04):Math.floor((canvas.height-height)/2);
-        ctx.fillStyle=options.lowContrast?'rgb(112,112,112)':'black';
+        barContext.fillStyle=`rgb(${dark},${dark},${dark})`;
         for(const char of code){
           for(let i=0;i<9;i++){
             const width=narrow*((patterns[char]&(1<<(8-i)))?3:1);
-            if(i%2===0)ctx.fillRect(x,y,width,height);
+            if(i%2===0)barContext.fillRect(x,y,width,height);
             x+=width;
           }
           x+=narrow;
         }
+        ctx.filter=`blur(${options.blur||0}px)`;ctx.drawImage(bars,0,0);ctx.filter='none';
       }
+      return canvas;
+    }
+    state.picture=picture;
+    const fixturePicture=picture();
+    function draw(canvas,frame){
+      const ctx=canvas.getContext('2d');ctx.drawImage(fixturePicture,0,0);
       // Ensure every requested frame has a distinct image/timestamp.
       ctx.fillStyle=frame%2?'#e1e1e1':'#eeeeee';ctx.fillRect(0,0,2,2);
     }
@@ -112,6 +125,61 @@ async function waitForRegistration(page){
   assert.equal(await page.locator('#cameraVideo').evaluate(video=>video.srcObject),null);
 }
 
+// Keep the former four camera passes as a comparison for difficult fixtures.
+// The production reader is unmodified; only the old preprocessing is recreated.
+async function oldCameraPasses(page){
+  return page.evaluate(async()=>{
+    const source=window.__cameraTest.picture(),results=[];
+    for(let pass=0;pass<4;pass++){
+      const full=pass>=2,width=source.width,height=source.height;
+      const sy=full?0:Math.round(height*.2),sh=full?height:Math.round(height*.6);
+      const scale=Math.min(1,2560/Math.max(width,sh),Math.sqrt(2000000/(width*sh)));
+      const canvas=document.createElement('canvas');canvas.width=Math.floor(width*scale);canvas.height=Math.floor(sh*scale);
+      const ctx=canvas.getContext('2d');ctx.drawImage(source,0,sy,width,sh,0,0,canvas.width,canvas.height);
+      const frame=ctx.getImageData(0,0,canvas.width,canvas.height);
+      if(pass%2===1){
+        const data=frame.data;
+        for(let i=0;i<data.length;i+=4){
+          const gray=Math.round(data[i]*.299+data[i+1]*.587+data[i+2]*.114);
+          data[i]=data[i+1]=data[i+2]=Math.max(0,Math.min(255,Math.round((gray-128)*1.7+128)));
+        }
+      }
+      results.push((await window.__originalReader(frame,{...window.__readerOptions,tryDownscale:false})).map(result=>result.text));
+    }
+    return results;
+  });
+}
+
+test('automatic detail processing reads blurred one-pixel bars lost by the former resize passes',async t=>{
+  const page=await fixture(t,{width:3840,height:2160,narrow:1,blur:.5});
+  assert.equal((await oldCameraPasses(page)).flat().includes('P009000'),false,'former resized camera passes cannot read this fixture');
+  await start(page);await waitForRegistration(page);
+});
+
+test('automatic contrast processing recovers pale blurred bars that raw and fixed contrast miss',async t=>{
+  for(const [width,height] of [[1920,1080],[1080,1920]]){
+    const page=await fixture(t,{width,height,narrow:2,blur:.6,dark:225,light:240});
+    assert.equal((await oldCameraPasses(page)).flat().includes('P009000'),false,'former raw and fixed-contrast passes cannot read this fixture');
+    await start(page);await waitForRegistration(page);
+  }
+});
+
+test('contrast recovery handles gray labels and preserves bright and dark barcode details',async t=>{
+  for(const [dark,light] of [[130,140],[210,235],[20,40]]){
+    const page=await fixture(t,{narrow:2,dark,light});
+    const previous=await oldCameraPasses(page);
+    assert.equal(previous[1].includes('P009000')||previous[3].includes('P009000'),false,'the former fixed enhancement fails on this exposure');
+    if(dark===130)assert.equal(previous.flat().includes('P009000'),false,'raw decoding also fails on the low-contrast gray label');
+    const recovered=await page.evaluate(async()=>{
+      const source=window.__cameraTest.picture();
+      const frame=source.getContext('2d').getImageData(0,0,source.width,source.height);
+      return (await window.__originalReader(window.__enhanceContrast(frame),{...window.__readerOptions,tryDownscale:false})).map(result=>result.text);
+    });
+    assert.ok(recovered.includes('P009000'),'production contrast preprocessing preserves real barcode details');
+    if(dark===130){await start(page);await waitForRegistration(page);}
+  }
+});
+
 test('real WASM reads a low-contrast barcode outside the central crop in landscape and portrait',async t=>{
   for(const [width,height] of [[1920,1080],[1080,1920]]){
     const page=await fixture(t,{width,height,edge:true,lowContrast:true});
@@ -119,7 +187,7 @@ test('real WASM reads a low-contrast barcode outside the central crop in landsca
     const frames=await page.evaluate(()=>window.__decodes);
     assert.ok(frames.some(frame=>frame.texts.includes('P009000')),'real barcode decoded');
     assert.ok(frames.some(frame=>Math.abs(frame.width/frame.height-width/height)<.01&&frame.texts.includes('P009000')),'full-frame fallback reads a barcode outside the crop');
-    assert.ok(frames.every(frame=>Math.max(frame.width,frame.height)<=2560&&frame.width*frame.height<=2100000),'decode frames have a bounded pixel budget');
+    assert.ok(frames.every(frame=>Math.max(frame.width,frame.height)<=3840&&frame.width*frame.height<=1200000),'decode frames have a bounded pixel budget');
   }
 });
 
@@ -141,27 +209,28 @@ test('4K landscape and portrait sources remain readable with bounded decode memo
     await start(page);await waitForRegistration(page);
     const frames=await page.evaluate(()=>window.__decodes);
     assert.ok(frames.length>=2);
-    assert.ok(frames.every(frame=>Math.max(frame.width,frame.height)<=2560&&frame.width*frame.height<=2100000));
+    assert.ok(frames.every(frame=>Math.max(frame.width,frame.height)<=3840&&frame.width*frame.height<=1200000));
   }
 });
 
-test('supported focus, zoom and torch work; switching and closing release every stream',async t=>{
+test('focus is automatic with no zoom, light or camera switching controls; close releases the camera',async t=>{
   const page=await fixture(t,{blank:true});await start(page);
-  await page.waitForFunction(()=>!document.querySelector('#cameraZoom').disabled&&!document.querySelector('#switchCamera').hidden);
-  assert.equal(await page.locator('#cameraZoom').isVisible(),true);
-  assert.equal(await page.locator('#cameraTorch').isVisible(),true);
-  assert.ok(await page.evaluate(()=>window.__cameraTest.constraints.some(({value})=>JSON.stringify(value).includes('continuous'))),'autofocus requested when available');
-  await page.locator('#cameraZoom').fill('2');await page.locator('#cameraZoom').dispatchEvent('input');
-  await page.waitForFunction(()=>window.__cameraTest.streams[0].track.getSettings().zoom===2);
-  await page.locator('#cameraTorch').click();
-  await page.waitForFunction(()=>window.__cameraTest.streams[0].track.getSettings().torch===true);
-  await page.locator('#switchCamera').click();
-  await page.waitForFunction(()=>window.__cameraTest.streams.length===2&&document.querySelector('#cameraVideo').readyState>=2);
-  assert.equal(await page.evaluate(()=>window.__cameraTest.streams[0].track.readyState),'ended');
-  assert.notEqual(await page.evaluate(()=>window.__cameraTest.streams[1].track.getSettings().deviceId),'rear-main');
+  await page.waitForFunction(()=>window.__cameraTest.constraints.some(({value})=>JSON.stringify(value).includes('continuous')));
+  assert.equal(await page.locator('#cameraControls,#cameraZoom,#cameraTorch,#switchCamera').count(),0,'removed controls are absent from the DOM');
+  assert.equal(await page.evaluate(()=>window.__cameraTest.constraints.some(({value})=>/zoom|torch/.test(JSON.stringify(value)))),false,'automatic focus does not change zoom or torch');
+  assert.equal(await page.evaluate(()=>window.__cameraTest.streams.length),1);
   for(const viewport of [{width:360,height:640},{width:844,height:390},{width:568,height:320}]){
     await page.setViewportSize(viewport);
-    for(const id of ['closeScanner','cameraZoom','cameraTorch','switchCamera','scannerManual']){
+    await page.waitForFunction(()=>{
+      const video=document.querySelector('#cameraVideo'),view=document.querySelector('#cameraView').getBoundingClientRect();
+      const guide=document.querySelector('#cameraGuide').getBoundingClientRect();
+      const scale=Math.min(view.width/video.videoWidth,view.height/video.videoHeight);
+      const width=video.videoWidth*scale,height=video.videoHeight*scale;
+      const x=view.x+(view.width-width)/2,y=view.y+(view.height-height)/2;
+      return guide.x>=x-1&&guide.y>=y-1&&guide.right<=x+width+1&&guide.bottom<=y+height+1&&
+        Math.abs(guide.x+guide.width/2-view.x-view.width/2)<1&&Math.abs(guide.y+guide.height/2-view.y-view.height/2)<1;
+    });
+    for(const id of ['closeScanner','scannerManual']){
       const box=await page.locator('#'+id).boundingBox();assert.ok(box,`${id} visible`);
       assert.ok(box.x>=0&&box.y>=0&&box.x+box.width<=viewport.width+1&&box.y+box.height<=viewport.height+1,`${id} fits ${viewport.width}x${viewport.height}`);
     }
@@ -173,10 +242,10 @@ test('supported focus, zoom and torch work; switching and closing release every 
   assert.equal(await page.locator('#histList .row').count(),0);
 });
 
-test('unsupported camera controls stay hidden and optional constraints cannot prevent scanning',async t=>{
+test('missing or rejected optional focus settings cannot prevent scanning',async t=>{
   const page=await fixture(t,{unsupported:true,blank:true});await start(page);
-  assert.equal(await page.locator('#cameraZoom').isVisible(),false);
-  assert.equal(await page.locator('#cameraTorch').isVisible(),false);
+  assert.equal(await page.locator('#cameraControls,#cameraZoom,#cameraTorch,#switchCamera').count(),0);
+  assert.equal(await page.evaluate(()=>window.__cameraTest.constraints.length),0);
   await page.locator('#closeScanner').click();
   const rejecting=await fixture(t,{rejectConstraints:true});await start(rejecting);await waitForRegistration(rejecting);
 });
